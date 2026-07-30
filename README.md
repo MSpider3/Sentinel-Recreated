@@ -1,5 +1,9 @@
 # Sentinel Recreated
 
+![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)
+![Platform: Linux](https://img.shields.io/badge/Platform-Linux-informational)
+![Language: Rust](https://img.shields.io/badge/Language-Rust-orange)
+
 Face authentication for Linux — unlock sudo, your login screen, and lock screen by looking at your webcam.
 
 ## What It Does
@@ -86,7 +90,7 @@ Webcam → [Rust daemon] → SCRFD detect → 5-pt align → MobileFaceNet embed
 PAM_SUCCESS (face matched) or PAM_IGNORE (fall through to password)
 ```
 
-- **`sentinel-core`** — Rust daemon running as root. Owns the camera, models, and gallery. Exposes a single DBus method: `Authenticate(username)`.
+- **`sentinel-core`** — Rust daemon running as root. Owns the camera, models, and gallery. Exposes a DBus interface (`com.sentinel.Sentinel`) for authentication, enrollment, configuration, and intrusion review.
 - **`pam-sentinel`** — Thin C shared library (`< 200 LOC`). Calls the daemon over DBus and maps the result to PAM return codes. Contains zero biometric code.
 - **`sentinel-py`** — Python CLI and Textual TUI for enrollment, status, and configuration.
 
