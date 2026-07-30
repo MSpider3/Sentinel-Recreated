@@ -132,9 +132,9 @@ install_system_deps() {
 
     case "$distro_family" in
         fedora|rhel|centos)
-            dnf install -y \
+            dnf install -y --skip-unavailable \
                 gstreamer1-devel gstreamer1-plugins-base-devel \
-                gstreamer1-plugins-good gstreamer1-plugin-pipewire \
+                gstreamer1-plugins-good pipewire-gstreamer \
                 pam-devel dbus-devel meson ninja-build pkg-config \
                 opencv-devel wget unzip
             ;;
