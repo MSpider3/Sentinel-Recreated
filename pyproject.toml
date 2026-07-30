@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sentinel-py"
+version = "0.1.0"
+description = "Sentinel Recreated Face Authentication CLI & Enrollment Wizard"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "opencv-python",
+    "dbus-python",
+    "numpy"
+]
+
+[project.scripts]
+sentinel = "sentinel_py.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sentinel_py*"]

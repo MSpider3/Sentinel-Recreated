@@ -1,0 +1,22 @@
+Sentinel Anti-Spoofing Report — 2026-07-26 02:42:59
+Tested User: mehulgolecha
+======================================================================
+
+[Test 1: Live Face]
+  Attempt 1: status=GRANTED    dist=0.1788 tier=1
+  Attempt 2: status=GRANTED    dist=0.2038 tier=1
+  Attempt 3: status=GRANTED    dist=0.2045 tier=1
+  Attempt 4: status=GRANTED    dist=0.2086 tier=1
+  Attempt 5: status=GRANTED    dist=0.2156 tier=1
+  Live Pass Rate: 5/5 | Result: PASS
+
+[Test 2: Photo Spoof Attack]
+  Attempt 1: status=DENIED     dist=0.9609 tier=4
+  Attempt 2: status=DENIED     dist=0.8580 tier=4
+  Attempt 3: status=DENIED     dist=0.9434 tier=4
+  Attempt 4: status=DENIED     dist=0.9907 tier=4
+  Attempt 5: status=DENIED     dist=0.9444 tier=4
+  Explicit SPOOF Rejections  : 0
+  Distance DENIED Rejections : 5
+  Total Security Rejections  : 5/5 | Result: PASS
+  Note: Spoof protection relied primarily on distance thresholding (DENIED). Consider tuning MiniFASNet calibration if higher explicit SPOOF rates are desired.

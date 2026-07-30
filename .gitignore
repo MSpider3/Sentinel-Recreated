@@ -1,0 +1,35 @@
+# Rust
+/target
+Cargo.lock
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+env/
+venv/
+
+# C / Meson / Ninja
+pam-sentinel/build/
+.ninja_deps
+.ninja_log
+compile_commands.json
+
+# Models & Data (downloaded or generated at runtime)
+*.onnx
+*.zip
+/var/
+/tmp/
+
+# IDE & OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store

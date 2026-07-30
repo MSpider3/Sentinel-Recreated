@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+  "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+  "http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd">
+<policyconfig>
+
+  <vendor>Sentinel Recreated Facial Authentication Project</vendor>
+  <vendor_url>https://github.com/mehulgolecha/sentinel</vendor_url>
+
+  <action id="com.sentinel.enroll">
+    <description>Start interactive facial biometric enrollment</description>
+    <message>Authentication is required to enroll biometric identity templates.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="com.sentinel.remove_user">
+    <description>Remove enrolled user biometric template data</description>
+    <message>Administrative authorization is required to remove biometric templates.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+  </action>
+
+  <action id="com.sentinel.set_config">
+    <description>Modify Sentinel daemon system configuration</description>
+    <message>Administrative authorization is required to change biometric security parameters.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+  </action>
+
+  <action id="com.sentinel.get_intrusions">
+    <description>Access intruder capture log screenshots</description>
+    <message>Authentication is required to view security intrusion logs.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="com.sentinel.reset_calibration">
+    <description>Reset and run MiniFASNet anti-spoof calibration</description>
+    <message>Authentication is required to calibrate anti-spoof security parameters.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+</policyconfig>

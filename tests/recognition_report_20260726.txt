@@ -1,0 +1,44 @@
+Sentinel Biometric Recognition Accuracy Report — 2026-07-26 04:12:28
+Tested User: mehulgolecha
+======================================================================
+
+[Test 1: Self Recognition]
+  Attempt  1: status=GRANTED    dist=0.1899 tier=Tier 1 (Golden)
+  Attempt  2: status=GRANTED    dist=0.1786 tier=Tier 1 (Golden)
+  Attempt  3: status=GRANTED    dist=0.1776 tier=Tier 1 (Golden)
+  Attempt  4: status=GRANTED    dist=0.1837 tier=Tier 1 (Golden)
+  Attempt  5: status=GRANTED    dist=0.1761 tier=Tier 1 (Golden)
+  Attempt  6: status=GRANTED    dist=0.1754 tier=Tier 1 (Golden)
+  Attempt  7: status=GRANTED    dist=0.1688 tier=Tier 1 (Golden)
+  Attempt  8: status=GRANTED    dist=0.1669 tier=Tier 1 (Golden)
+  Attempt  9: status=GRANTED    dist=0.1737 tier=Tier 1 (Golden)
+  Attempt 10: status=GRANTED    dist=0.1690 tier=Tier 1 (Golden)
+  Pass Rate: 10/10 in Tier 1/2 | Mean Distance: 0.1760 | Result: PASS
+
+[Test 2: Distance Sensitivity]
+  Normal position mean distance : 0.1642
+  +30cm further mean distance   : 0.1766
+  -30cm closer mean distance    : 0.1568
+
+[Threshold Recommendations]
+  Observed mean distance at normal position: 0.1642
+  Recommended golden_threshold   : 0.150
+  Recommended standard_threshold : 0.214
+
+[Test 3: Lighting Variation]
+  Normal light mean distance   : 0.1647
+  Screen-only mean distance    : 1.0000
+  Restored light mean distance : 0.1477
+
+[Test 4: Glasses Cross-Test]
+  Glasses ON mean distance  : 0.1380
+  Glasses OFF mean distance : 0.0831
+  Result                    : PASS
+
+[Test 5: False Acceptance Threshold]
+  Attempt 1: status=DENIED     dist=0.9345 tier=Tier 4 (Denied)
+  Attempt 2: status=DENIED     dist=1.0000 tier=Tier 4 (Denied)
+  Attempt 3: status=DENIED     dist=1.0000 tier=Tier 4 (Denied)
+  Attempt 4: status=DENIED     dist=0.9388 tier=Tier 4 (Denied)
+  Attempt 5: status=DENIED     dist=1.0000 tier=Tier 4 (Denied)
+  Denied Count: 5/5 | Result: PASS

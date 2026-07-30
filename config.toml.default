@@ -1,0 +1,26 @@
+[camera]
+source = "/dev/video0"
+width = 640
+height = 480
+fps = 30
+
+[detection]
+scrfd_input_size = 320
+min_face_size_px = 40
+score_threshold = 0.50
+nms_threshold = 0.30
+
+[security]
+golden_threshold = 0.28
+standard_threshold = 0.42
+two_factor_threshold = 0.50
+recognition_threshold = 0.38
+spoof_threshold = 0.80
+max_retries = 3
+challenge_timeout_secs = 20.0
+gallery_max_size = 20
+
+[storage]
+data_dir = "/var/lib/sentinel"
+models_dir = "/var/cache/sentinel/models"
+log_dir = "/var/log/sentinel"
