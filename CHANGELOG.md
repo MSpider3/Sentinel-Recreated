@@ -5,6 +5,16 @@ All notable changes to Sentinel Recreated will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-08-01
+
+### Fixed
+- **Continuous Scanning after Face Obstruction**: Fixed `STATE_WAITING` state machine logic so face obstruction or transient no-detection frames stay in `STATE_WAITING` rather than timing out prematurely or failing.
+- **Lock Screen Password Field Behavior**: Added `PAM_AUTHTOK` check in `pam_sentinel.c` so entering a password directly in the DMS/lock screen input field steps aside (`PAM_IGNORE`) and bypasses opening the camera for face authentication.
+- **Explicit Auth Failure Handling**: Updated PAM return code mapping to return `PAM_AUTH_ERR` for `TIMEOUT`, `DENIED`, `SPOOF`, and `REQUIRE_2FA` outcomes so lock screens present a clear failure notification before prompting for password.
+
+### Added
+- **Camera Auto-Exposure Warmup**: Added initial frame skip counter (5 frames) on cold camera startup to allow sensor auto-exposure and white balance to stabilize before starting face detection.
+
 ## [0.1.0] - 2026-07-31
 
 ### Added
