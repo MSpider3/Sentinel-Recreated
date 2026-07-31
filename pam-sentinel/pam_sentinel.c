@@ -107,6 +107,16 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
     if (pam_get_user(pamh, &user, NULL) != PAM_SUCCESS || !user || user[0] == '\0')
         return PAM_IGNORE;
 
+    /* 1b. DMS Enter-key fix: if the user has already typed a password into the
+     *     lock-screen password field, the authtok will be non-empty.  In that
+     *     case we step aside immediately so pam_unix.so can verify it — the
+     *     camera should NOT open.  When the field is empty (plain Enter press),
+     *     authtok is NULL and we proceed with face authentication normally. */
+    const char *authtok = NULL;
+    pam_get_item(pamh, PAM_AUTHTOK, (const void **)&authtok);
+    if (authtok != NULL && authtok[0] != '\0')
+        return PAM_IGNORE;
+
     /* 2. Connect to system DBus */
     DBusError e; dbus_error_init(&e);
     DBusConnection *conn = dbus_bus_get_private(DBUS_BUS_SYSTEM, &e);
@@ -127,16 +137,63 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
     const char *result = sentinel_call(conn, user, ssh_c, ssh_t);
     dbus_connection_close(conn); dbus_connection_unref(conn);
 
-    /* 6. Failure / timeout → fail-safe */
+    /* 6. DBus RPC failed / daemon returned no payload → transparent fallback.
+     *    This is an infrastructure failure, not a recognition decision, so we
+     *    step aside and let pam_unix.so prompt for a password silently. */
     if (!result) return PAM_IGNORE;
 
-    /* 7. Map result string to PAM return code */
-    if      (!strcmp(result, "GRANTED"))     return PAM_SUCCESS;
-    else if (!strcmp(result, "REQUIRE_2FA")) return PAM_AUTH_ERR;
-    else if (!strcmp(result, "DENIED"))      return PAM_AUTH_ERR;
-    else if (!strcmp(result, "TIMEOUT"))     return PAM_AUTH_ERR;
-    else if (!strcmp(result, "SPOOF"))       return PAM_AUTH_ERR;
-    else                                     return PAM_IGNORE;
+    /* 7. Map daemon result string → PAM return code.
+     *
+     * Semantic distinction:
+     *   PAM_IGNORE   = "I have no opinion" — infrastructure not available or
+     *                  no face was ever presented.  PAM silently falls through
+     *                  to the next module (pam_unix.so → password prompt).
+     *   PAM_AUTH_ERR = "I tried and it failed" — the daemon actively attempted
+     *                  recognition but could not grant access.  PAM shows an
+     *                  "authentication failed" notice before the password prompt,
+     *                  giving the user clear feedback that face auth was attempted.
+     *
+     * Rule of thumb: if a camera session was opened and a face was involved,
+     * use PAM_AUTH_ERR.  If the camera never meaningfully engaged, use PAM_IGNORE.
+     */
+    if (!strcmp(result, "GRANTED"))
+        /* Face matched — unlock immediately. */
+        return PAM_SUCCESS;
+
+    if (!strcmp(result, "NO_FACE"))
+        /* Daemon found no face in the field of view (camera opened but no
+         * subject detected, or user walked away before detection).  No
+         * recognition was attempted — silently fall through to password. */
+        return PAM_IGNORE;
+
+    if (!strcmp(result, "TIMEOUT"))
+        /* Camera was open and a liveness session ran, but the user did not
+         * complete the challenge within the time limit.  This is an active
+         * failure: return PAM_AUTH_ERR so the lock screen shows a failure
+         * notice before falling through to the password prompt.  This is the
+         * correct UX — the user sees that face auth was attempted and expired,
+         * then gets a clean password prompt rather than a silent transition. */
+        return PAM_AUTH_ERR;
+
+    if (!strcmp(result, "DENIED"))
+        /* Face was detected and recognised but distance exceeded all thresholds.
+         * Active failure — password prompt with failure notice. */
+        return PAM_AUTH_ERR;
+
+    if (!strcmp(result, "SPOOF"))
+        /* Anti-spoof classifier rejected the presentation.  Active security
+         * failure — password prompt with failure notice. */
+        return PAM_AUTH_ERR;
+
+    if (!strcmp(result, "REQUIRE_2FA"))
+        /* Biometric passed at Tier 3 but policy requires a second factor.
+         * Fall through to pam_unix.so so the user can supply their password
+         * as the second factor.  PAM_AUTH_ERR triggers the prompt correctly. */
+        return PAM_AUTH_ERR;
+
+    /* Unknown / future result token or malformed payload.
+     * Treat as infrastructure uncertainty — transparent fallback. */
+    return PAM_IGNORE;
 }
 
 /* pam_sm_setcred: required export for PAM_SM_AUTH modules.

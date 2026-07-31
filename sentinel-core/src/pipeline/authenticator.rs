@@ -30,10 +30,13 @@ const TWO_FACTOR_THRESHOLD: f32 = 0.50;
 const MAX_RETRIES: u32 = 3;
 const CHALLENGE_TIMEOUT_SECS: f64 = 20.0;
 const GLOBAL_SESSION_TIMEOUT_SECS: f64 = 120.0;
-/// Frames without a face before a session reset
+/// Frames without a face before a session reset (only applies when state != Waiting)
 const SESSION_RESET_GRACE_PERIOD: u32 = 30;
 /// Max pixel movement between frames before we lose face-lock
 const MAX_MOVEMENT_THRESHOLD_SQ: f32 = 200.0 * 200.0;
+/// Number of initial frames to skip to allow camera auto-exposure to stabilise.
+/// Cold cameras often produce dark or blurry frames for the first few ticks.
+const WARMUP_FRAMES: u32 = 5;
 
 // ─── State Machine ─────────────────────────────────────────────────────────────
 
@@ -200,6 +203,11 @@ pub struct SentinelAuthenticator {
     // Random challenge sequence
     challenge_rng_idx: usize,
 
+    // Camera warmup: counts frames elapsed since start/reset.
+    // Face detection is skipped until this reaches WARMUP_FRAMES so that
+    // auto-exposure has time to stabilise on cold camera start.
+    warmup_frames_elapsed: u32,
+
     // Audit logger
     audit_logger: AuditLogger,
     blacklist_mgr: BlacklistManager,
@@ -255,7 +263,7 @@ impl SentinelAuthenticator {
             target_user,
             config,
             state: AuthState::Waiting,
-            message: "Ready. Look at the camera.".to_string(),
+            message: "Initialising camera...".to_string(),
             locked_face_center: None,
             matched_user: None,
             last_distance: None,
@@ -267,6 +275,7 @@ impl SentinelAuthenticator {
             retry_count: 0,
             session_start: Instant::now(),
             challenge_rng_idx: rng_idx,
+            warmup_frames_elapsed: 0,
             audit_logger: AuditLogger::new(),
             blacklist_mgr: BlacklistManager::new(),
         }
@@ -313,7 +322,10 @@ impl SentinelAuthenticator {
         self.liveness = None;
         self.frames_no_face = 0;
         self.blink_detector = BlinkDetector::new();
+        // Reset warmup so that if the camera is re-opened or the pipeline is
+        // restarted we skip the first few frames again.
         if full_reset {
+            self.warmup_frames_elapsed = 0;
             self.matched_user = None;
             self.last_distance = None;
             self.active_tier = None;
@@ -347,6 +359,20 @@ impl SentinelAuthenticator {
             self.state = AuthState::Failure;
             self.message = "Maximum attempts reached.".to_string();
             self.log_audit("TIMEOUT", 4, "CHALLENGE_TIMEOUT");
+            return Ok(self.make_result(None));
+        }
+
+        // ── Camera warmup ───────────────────────────────────────────────────
+        // Skip the first WARMUP_FRAMES frames so the camera's automatic
+        // exposure / white-balance can stabilise. Dark or blurry warmup frames
+        // would produce spurious "no face" results; silently dropping them is
+        // safer than treating them as detection failures.
+        if self.warmup_frames_elapsed < WARMUP_FRAMES {
+            self.warmup_frames_elapsed += 1;
+            self.message = format!(
+                "Initialising camera... ({}/{})",
+                self.warmup_frames_elapsed, WARMUP_FRAMES
+            );
             return Ok(self.make_result(None));
         }
 
