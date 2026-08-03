@@ -89,6 +89,10 @@ class SentinelDBusClient:
         res = self.iface.RunSpoofCalibration()
         return str(res)
 
+    def get_recent_auth_log(self, lines: int = 10) -> list[str]:
+        logs = self.iface.GetRecentAuthLog(dbus.UInt32(lines))
+        return [str(l) for l in logs]
+
     def listen_auth_status(self, callback_func):
         """Subscribe to AuthStatusChanged signals and run callback_func(status, message)."""
         def signal_handler(status, message):

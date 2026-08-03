@@ -185,6 +185,7 @@ fn main() -> Result<()> {
                 AuthState::Success    => "[SUCCESS]",
                 AuthState::Failure    => "[FAILURE]",
                 AuthState::Require2FA => "[2FA REQUIRED]",
+                AuthState::NoFace     => "[NO FACE]",
             };
             println!("{} {}", prefix, result.message);
             if let (Some(user), Some(dist)) = (&result.matched_user, result.distance) {
@@ -211,6 +212,7 @@ fn main() -> Result<()> {
                     AuthState::Success    => COLOR_TIER1, // Green
                     AuthState::Failure    => COLOR_TIER4, // Red
                     AuthState::Require2FA => COLOR_TIER3, // Orange
+                    AuthState::NoFace     => COLOR_TIER4, // Red
                 }
             } else {
                 COLOR_TIER4

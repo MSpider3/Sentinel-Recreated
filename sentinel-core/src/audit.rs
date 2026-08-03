@@ -153,7 +153,7 @@ impl AuditLogger {
         {
             if let Ok(m) = fs::metadata(&file_path) {
                 let mut perms = m.permissions();
-                perms.set_mode(0o640);
+                perms.set_mode(0o644);
                 fs::set_permissions(&file_path, perms).ok();
             }
         }

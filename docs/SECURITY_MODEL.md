@@ -84,3 +84,16 @@ TIMESTAMP|USER|RESULT|DISTANCE|TIER|LIVENESS_STATUS|SPOOF_SCORE|DURATION_MS
 > [!NOTE]
 > In all failure cases above, Sentinel fails **open-safe**: the daemon returns `PAM_IGNORE`, allowing PAM to fall through to the standard password prompt. No biometric failure will lock a user out of their system.
 
+---
+
+## 6. Tier Behavior in Practice
+
+The four-tier system provides graceful degradation across varying hardware quality:
+
+- **High-quality setup** (good camera, consistent lighting): Tier 1 Golden on every successful auth. Tier 2/3 only trigger if `golden_threshold` is lowered deliberately.
+- **Average setup**: Mix of Tier 1 and Tier 2 depending on conditions.
+- **Poor conditions** (bad lighting, low-quality camera): Tier 2/3 more common.
+
+The default `golden_threshold = 0.28` is calibrated for the maintainer's hardware (Intel i3, 720p webcam, Fedora 44). Users with different hardware may want to adjust this in `/etc/sentinel/config.toml`.
+
+

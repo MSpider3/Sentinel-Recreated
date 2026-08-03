@@ -98,24 +98,21 @@ class DashboardScreen(Screen):
         except Exception as e:
             self.query_one("#status_panel", Static).update(f"[red]Error fetching status: {e}[/red]")
 
-        # Auth log reading with missing/empty file graceful handling
+        # Auth log reading via DBus service call
         table = self.query_one("#log_table", DataTable)
         table.clear()
-        today_log = datetime.now().strftime("/var/log/sentinel/auth_%Y-%m-%d.log")
         has_entries = False
-        if os.path.exists(today_log):
-            try:
-                with open(today_log, "r") as f:
-                    lines = [line.strip() for line in f if line.strip()][-10:]
-                for line in lines:
-                    parts = line.split("|")
-                    if len(parts) >= 8:
-                        ts, usr, res, dist, tier, live, spoof, ms = parts[:8]
-                        c = "green" if res == "GRANTED" else ("red" if res == "DENIED" else "yellow")
-                        table.add_row(ts, usr, f"[{c}]{res}[/{c}]", dist, tier, live, spoof, ms)
-                        has_entries = True
-            except Exception:
-                pass
+        try:
+            lines = self.app.dbus_client.get_recent_auth_log(10)
+            for line in lines:
+                parts = line.split("|")
+                if len(parts) >= 8:
+                    ts, usr, res, dist, tier, live, spoof, ms = parts[:8]
+                    c = "green" if res == "GRANTED" else ("red" if res == "DENIED" else "yellow")
+                    table.add_row(ts, usr, f"[{c}]{res}[/{c}]", dist, tier, live, spoof, ms)
+                    has_entries = True
+        except Exception:
+            pass
         if not has_entries:
             table.add_row("-", "-", "[dim]No auth events today[/dim]", "-", "-", "-", "-", "-")
 

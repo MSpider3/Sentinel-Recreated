@@ -29,7 +29,6 @@ const TWO_FACTOR_THRESHOLD: f32 = 0.50;
 
 const MAX_RETRIES: u32 = 3;
 const CHALLENGE_TIMEOUT_SECS: f64 = 20.0;
-const GLOBAL_SESSION_TIMEOUT_SECS: f64 = 120.0;
 /// Frames without a face before a session reset (only applies when state != Waiting)
 const SESSION_RESET_GRACE_PERIOD: u32 = 30;
 /// Max pixel movement between frames before we lose face-lock
@@ -47,6 +46,7 @@ pub enum AuthState {
     Success,
     Failure,
     Require2FA,
+    NoFace,
 }
 
 /// Tier in use for the current session — mirrors Python `active_tier`.
@@ -195,6 +195,7 @@ pub struct SentinelAuthenticator {
     liveness: Option<LivenessChecklist>,
     blink_detector: BlinkDetector,
     frames_no_face: u32,
+    no_face_start: Option<Instant>,
 
     // Retry / timeout
     retry_count: u32,
@@ -272,6 +273,7 @@ impl SentinelAuthenticator {
             liveness: None,
             blink_detector: BlinkDetector::new(),
             frames_no_face: 0,
+            no_face_start: None,
             retry_count: 0,
             session_start: Instant::now(),
             challenge_rng_idx: rng_idx,
@@ -321,6 +323,7 @@ impl SentinelAuthenticator {
         self.locked_face_center = None;
         self.liveness = None;
         self.frames_no_face = 0;
+        self.no_face_start = None;
         self.blink_detector = BlinkDetector::new();
         // Reset warmup so that if the camera is re-opened or the pipeline is
         // restarted we skip the first few frames again.
@@ -346,8 +349,14 @@ impl SentinelAuthenticator {
 
     /// Process one camera frame through the full authentication pipeline.
     pub fn process_frame(&mut self, frame: &RgbImage) -> Result<AuthResult> {
+        // Fast-fail timer ONLY applies in AuthState::Waiting
+        if self.state != AuthState::Waiting {
+            self.no_face_start = None;
+        }
+
         // ── Global timeout ──────────────────────────────────────────────────
-        if self.session_start.elapsed().as_secs_f64() > GLOBAL_SESSION_TIMEOUT_SECS {
+        let global_timeout = self.config.security.global_session_timeout;
+        if self.session_start.elapsed().as_secs_f64() > global_timeout {
             self.state = AuthState::Failure;
             self.message = "Session timed out.".to_string();
             self.log_audit("TIMEOUT", 4, "SKIPPED");
@@ -413,6 +422,15 @@ impl SentinelAuthenticator {
         // ── Face lost handling ───────────────────────────────────────────────
         if active_face.is_none() {
             self.frames_no_face += 1;
+            if self.state == AuthState::Waiting {
+                let start = *self.no_face_start.get_or_insert_with(Instant::now);
+                if start.elapsed().as_secs_f64() > 3.0 {
+                    println!("[Auth] No face detected for 3.0s in Waiting state — fast-failing session.");
+                    self.state = AuthState::NoFace;
+                    self.message = "No face detected.".to_string();
+                    return Ok(self.make_result(None));
+                }
+            }
             if self.frames_no_face > SESSION_RESET_GRACE_PERIOD && self.state != AuthState::Waiting {
                 println!("[Auth] Face lost — resetting session.");
                 self.reset(false);
@@ -424,10 +442,11 @@ impl SentinelAuthenticator {
         }
 
         self.frames_no_face = 0;
+        self.no_face_start = None;
         let bbox = active_face.unwrap();
         self.locked_face_center = Some(Self::center_of(&bbox));
 
-        // ── Spoof check ──────────────────────────────────────────────────────
+        // ── Calibration check ────────────────────────────────────────────────
         if let Some(ref mut spoof) = self.spoof {
             if spoof.is_calibrating() {
                 if let Ok(crop) = SpoofDetector::square_crop(frame, bbox, 1.5) {
@@ -436,38 +455,6 @@ impl SentinelAuthenticator {
                     self.message = format!("Calibrating anti-spoof... ({}/80)", n);
                     return Ok(self.make_result(Some(bbox)));
                 }
-            } else {
-                if let Ok(crop) = SpoofDetector::square_crop(frame, bbox, 1.5) {
-                    match spoof.predict(&crop) {
-                        Ok((is_real, confidence)) => {
-                            self.last_spoof_score = Some(confidence);
-                            if !is_real {
-                                self.retry_count += 1;
-                                let remaining = MAX_RETRIES.saturating_sub(self.retry_count);
-                                println!(
-                                    "[Auth] Spoof detected (conf={:.2}). Retries left: {}",
-                                    confidence, remaining
-                                );
-                                self.reset(true);
-                                self.message = format!(
-                                    "Spoof detected! Attempts left: {}",
-                                    remaining
-                                );
-                                return Ok(self.make_result(Some(bbox)));
-                            }
-                            if let Some(ref mut lv) = self.liveness {
-                                lv.spoof_ok = true;
-                            }
-                        }
-                        Err(e) => {
-                            println!("[Auth] Spoof error: {e} — skipping");
-                        }
-                    }
-                }
-            }
-        } else {
-            if let Some(ref mut lv) = self.liveness {
-                lv.spoof_ok = true;
             }
         }
 
@@ -513,7 +500,7 @@ impl SentinelAuthenticator {
 
                         match ActiveTier::from_auth_tier(&tier) {
                             None => {
-                                // Tier 4: Denied
+                                // Tier 4: Denied (skip spoof check — already denied)
                                 println!("[Auth] Unknown face — access denied.");
                                 self.state = AuthState::Failure;
                                 self.message = "Access Denied.".to_string();
@@ -532,7 +519,53 @@ impl SentinelAuthenticator {
                                 self.active_tier = Some(active_tier);
                                 self.matched_user = Some(self.target_user.clone());
 
-                                // Tier 1 (Golden: d < 0.25): Skip head pose and blink challenges, grant access immediately.
+                                // Tier 3 (2FA): skip spoof check — user will supply password anyway
+                                if active_tier == ActiveTier::TwoFactor {
+                                    println!("[Auth] Tier 3 (2FA Required, d={:.4}) — skipping spoof check.", dist);
+                                    self.state = AuthState::Require2FA;
+                                    self.message = format!("2FA required for user {}", self.target_user);
+                                    self.log_audit("REQUIRE_2FA", 3, "SKIPPED");
+                                    return Ok(self.make_result(Some(bbox)));
+                                }
+
+                                // Tier 1 (Golden) & Tier 2 (Standard): Run per-tier spoof check
+                                let spoof_threshold = match active_tier {
+                                    ActiveTier::Golden => self.config.security.spoof_threshold_golden,
+                                    ActiveTier::Standard => self.config.security.spoof_threshold_standard,
+                                    ActiveTier::TwoFactor => unreachable!(),
+                                };
+
+                                if let Some(ref mut spoof) = self.spoof {
+                                    if let Ok(crop) = SpoofDetector::square_crop(frame, bbox, 1.5) {
+                                        match spoof.predict(&crop) {
+                                            Ok((_is_real, confidence)) => {
+                                                self.last_spoof_score = Some(confidence);
+                                                if confidence < spoof_threshold {
+                                                    self.retry_count += 1;
+                                                    let remaining = MAX_RETRIES.saturating_sub(self.retry_count);
+                                                    println!(
+                                                        "[Auth] Spoof detected for Tier {:?} (conf={:.2} < thresh={:.2}). Retries left: {}",
+                                                        active_tier, confidence, spoof_threshold, remaining
+                                                    );
+                                                    self.reset(true);
+                                                    self.message = format!(
+                                                        "Spoof detected! Attempts left: {}",
+                                                        remaining
+                                                    );
+                                                    return Ok(self.make_result(Some(bbox)));
+                                                }
+                                                if let Some(ref mut lv) = self.liveness {
+                                                    lv.spoof_ok = true;
+                                                }
+                                            }
+                                            Err(e) => {
+                                                println!("[Auth] Spoof error: {e} — skipping");
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Tier 1 (Golden: d < 0.28): Skip head pose and blink challenges, grant access immediately.
                                 if active_tier == ActiveTier::Golden {
                                     println!(
                                         "[Auth] GOLDEN match (d={:.4}) — granting access immediately after spoof check.",
@@ -565,7 +598,7 @@ impl SentinelAuthenticator {
                                     return Ok(self.make_result(Some(bbox)));
                                 }
 
-                                // Tier 2 (Standard) & Tier 3 (2FA): Require head pose challenge -> blink detection
+                                // Tier 2 (Standard): Require head pose challenge -> blink detection
                                 let challenge = random_challenge(self.challenge_rng_idx);
                                 self.challenge_rng_idx = (self.challenge_rng_idx + 1) % 4;
                                 println!(
@@ -574,9 +607,7 @@ impl SentinelAuthenticator {
                                 );
                                 self.state = AuthState::Recognized;
                                 let mut lv = LivenessChecklist::new(challenge);
-                                if self.spoof.is_none() {
-                                    lv.spoof_ok = true;
-                                }
+                                lv.spoof_ok = true;
                                 self.liveness = Some(lv);
                                 self.message = format!(
                                     "Hi {}! Please: {}",

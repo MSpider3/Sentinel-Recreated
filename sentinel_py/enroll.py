@@ -62,6 +62,14 @@ class EnrollmentWizard:
                     )
                     total_captured_vectors += sub_count
 
+            # Multi-lighting pass option
+            if self._show_lighting_pass_prompt(cap, window_name, total_captured_vectors):
+                lighting_pose = POSES[0]
+                sub_count = self._run_pose_loop(
+                    cap, window_name, session_id, "Center (Lighting Pass)", lighting_pose['instruction'], total_poses_count + 1, total_poses_count + 1
+                )
+                total_captured_vectors += sub_count
+
             # Finish DBus enrollment session
             success, msg = self.client.finish_enrollment(session_id)
             print(f"\n[ENROLLMENT RESULT]: {msg}")
@@ -104,6 +112,39 @@ class EnrollmentWizard:
             if key == 27: # ESC
                 raise KeyboardInterrupt()
 
+    def _show_lighting_pass_prompt(self, cap: cv2.VideoCapture, window_name: str, total_vectors: int) -> bool:
+        prompt_lines = [
+            f"Standard poses complete ({total_vectors} vectors).",
+            "",
+            "For better recognition in varied conditions, we recommend one additional pass:",
+            "- Slightly dim your screen or change your lighting",
+            "- You will repeat just the CENTER pose 3 more times",
+            "",
+            "Press SPACE to do the lighting variation pass, or ENTER to skip."
+        ]
+        print("\n" + "\n".join(prompt_lines))
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            h, w = frame.shape[:2]
+            cv2.rectangle(frame, (20, h // 2 - 100), (w - 20, h // 2 + 100), (20, 20, 20), -1)
+            cv2.rectangle(frame, (20, h // 2 - 100), (w - 20, h // 2 + 100), (0, 255, 255), 2)
+
+            cv2.putText(frame, f"Standard poses complete ({total_vectors} vectors).", (30, h // 2 - 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            cv2.putText(frame, "Recommended: 1 additional pass under varied lighting", (30, h // 2 - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.putText(frame, "- Dim screen / change room lighting, repeat CENTER pose", (30, h // 2 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.putText(frame, "Press SPACE to do lighting pass, or ENTER to skip", (30, h // 2 + 35), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+
+            cv2.imshow(window_name, frame)
+            key = cv2.waitKey(30) & 0xFF
+            if key == 32: # SPACE
+                return True
+            if key in (13, 10): # ENTER
+                return False
+            if key == 27: # ESC
+                raise KeyboardInterrupt()
+
     def _run_pose_loop(self, cap: cv2.VideoCapture, window_name: str, session_id: str,
                        pose_name: str, instruction: str, pose_num: int, total_poses: int) -> int:
         sub_captured = 0
@@ -143,6 +184,12 @@ class EnrollmentWizard:
                 if status in ("ACCEPTED", "COMPLETE"):
                     sub_captured += 1
                     print(f"Captured sub-sample {sub_captured}/{target_sub} for {pose_name}")
+                    # Render UI so screen reflects updated capture count before delay
+                    self._render_ui(frame, pose_name, instruction, pose_num, total_poses, sub_captured, target_sub, status, face_bbox, is_complete=False)
+                    cv2.imshow(window_name, frame)
+                    cv2.waitKey(1)
+                    # 500ms post-capture delay for natural angle micro-variation
+                    time.sleep(0.5)
                 elif status == "MULTIPLE_FACES":
                     print("[Warning] Multiple faces in frame — positioning required.")
 

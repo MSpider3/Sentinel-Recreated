@@ -12,7 +12,7 @@
 #define SENTINEL_BUS  "com.sentinel.Sentinel"
 #define SENTINEL_PATH "/com/sentinel/Sentinel"
 #define SENTINEL_IFACE "com.sentinel.Sentinel"
-#define AUTH_TIMEOUT_MS 30000
+#define SENTINEL_DBUS_TIMEOUT_MS 8000
 
 static int sentinel_reachable(DBusConnection *c)
 {
@@ -74,7 +74,7 @@ static const char *sentinel_call(DBusConnection *c, const char *user,
 
     DBusError e; dbus_error_init(&e);
     DBusMessage *r = dbus_connection_send_with_reply_and_block(
-                         c, m, AUTH_TIMEOUT_MS, &e);
+                         c, m, SENTINEL_DBUS_TIMEOUT_MS, &e);
     dbus_message_unref(m);
     if (dbus_error_is_set(&e) || !r) { dbus_error_free(&e); return NULL; }
 
@@ -105,16 +105,6 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
      *    override with getuid() which returns root when greetd calls us. */
     const char *user = NULL;
     if (pam_get_user(pamh, &user, NULL) != PAM_SUCCESS || !user || user[0] == '\0')
-        return PAM_IGNORE;
-
-    /* 1b. DMS Enter-key fix: if the user has already typed a password into the
-     *     lock-screen password field, the authtok will be non-empty.  In that
-     *     case we step aside immediately so pam_unix.so can verify it — the
-     *     camera should NOT open.  When the field is empty (plain Enter press),
-     *     authtok is NULL and we proceed with face authentication normally. */
-    const char *authtok = NULL;
-    pam_get_item(pamh, PAM_AUTHTOK, (const void **)&authtok);
-    if (authtok != NULL && authtok[0] != '\0')
         return PAM_IGNORE;
 
     /* 2. Connect to system DBus */

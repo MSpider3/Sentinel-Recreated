@@ -73,13 +73,31 @@ pub struct SecurityConfig {
     #[serde(default = "default_recognition_threshold")]
     pub recognition_threshold: f32,
     pub spoof_threshold: f32,
+    #[serde(default = "default_spoof_threshold_golden")]
+    pub spoof_threshold_golden: f32,
+    #[serde(default = "default_spoof_threshold_standard")]
+    pub spoof_threshold_standard: f32,
     pub max_retries: u32,
     pub challenge_timeout_secs: f64,
+    #[serde(default = "default_global_session_timeout")]
+    pub global_session_timeout: f64,
     pub gallery_max_size: usize,
 }
 
 fn default_recognition_threshold() -> f32 {
     0.38
+}
+
+fn default_spoof_threshold_golden() -> f32 {
+    0.70
+}
+
+fn default_spoof_threshold_standard() -> f32 {
+    0.55
+}
+
+fn default_global_session_timeout() -> f64 {
+    25.0
 }
 
 impl Default for SecurityConfig {
@@ -89,9 +107,12 @@ impl Default for SecurityConfig {
             standard_threshold: 0.42,
             two_factor_threshold: 0.50,
             recognition_threshold: 0.38,
-            spoof_threshold: 0.80,
+            spoof_threshold: 0.70,
+            spoof_threshold_golden: 0.70,
+            spoof_threshold_standard: 0.55,
             max_retries: 3,
             challenge_timeout_secs: 20.0,
+            global_session_timeout: 25.0,
             gallery_max_size: 20,
         }
     }

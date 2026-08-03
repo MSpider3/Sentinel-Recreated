@@ -118,6 +118,7 @@ Face authentication is a **convenience factor and anti-shoulder-surfing measure*
 - **Low light** — Authentication fails when ambient light is too low for face detection. CLAHE preprocessing helps with mild low light but cannot compensate for near-darkness.
 - **Distance** — Reliable detection range is approximately 30–80 cm from camera. Beyond ~80 cm, the face bounding box may fall below the minimum size for SCRFD-500M at 320×320 input. Set `scrfd_input_size = 640` in `/etc/sentinel/config.toml` for better range at the cost of ~7 ms additional latency.
 - **MiniFASNet calibration** — On some cameras, the anti-spoof model relies primarily on distance thresholding rather than texture analysis. Run `sentinel calibrate-spoof` after enrollment to optimize for your camera.
+- **Tier thresholds are hardware-dependent** — The default `golden_threshold = 0.28` may result in Tier 1 on high-quality setups. Adjust in `/etc/sentinel/config.toml` based on your observed authentication distances (visible via `sentinel dashboard` or `journalctl -u sentinel`).
 
 ## Contributing
 

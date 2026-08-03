@@ -15,9 +15,12 @@ golden_threshold = 0.28
 standard_threshold = 0.42
 two_factor_threshold = 0.50
 recognition_threshold = 0.38
-spoof_threshold = 0.80
+spoof_threshold = 0.70
+spoof_threshold_golden = 0.70
+spoof_threshold_standard = 0.55
 max_retries = 3
 challenge_timeout_secs = 20.0
+global_session_timeout = 25.0
 gallery_max_size = 20
 
 [storage]

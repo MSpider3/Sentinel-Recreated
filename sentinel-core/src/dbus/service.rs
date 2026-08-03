@@ -260,6 +260,10 @@ impl SentinelService {
                             let dist = r.distance.unwrap_or(0.45) as f64;
                             return ("REQUIRE_2FA".to_string(), dist, 3);
                         }
+                        AuthState::NoFace => {
+                            capture.stop();
+                            return ("NO_FACE".to_string(), -1.0, 0);
+                        }
                         _ => {}
                     },
                     Err(_) => {
@@ -307,12 +311,7 @@ impl SentinelService {
         let (_pose_idx, _total_poses) = {
             let lock = self.active_enrollment.lock().unwrap();
             match lock.as_ref() {
-                Some(s) if s.session_id == session_id => {
-                    if s.pose_index >= s.total_poses {
-                        return Ok(("COMPLETE".to_string(), s.pose_index as i32, s.total_poses as i32, Vec::new()));
-                    }
-                    (s.pose_index, s.total_poses)
-                }
+                Some(s) if s.session_id == session_id => (s.pose_index, s.total_poses),
                 _ => return Ok(("NO_SESSION".to_string(), 0, 30, Vec::new())),
             }
         };
@@ -329,7 +328,7 @@ impl SentinelService {
                 0.35,
                 config.detection.nms_threshold,
                 config.detection.min_face_size_px,
-                640,
+                config.detection.scrfd_input_size,
             ) {
                 Ok(d) => d,
                 Err(_) => return ("NO_FACE".to_string(), None, Vec::new()),
@@ -349,21 +348,15 @@ impl SentinelService {
                 return ("NO_FACE".to_string(), None, Vec::new());
             }
 
-            let start = Instant::now();
-            let mut frame_opt: Option<RgbImage> = None;
-            while start.elapsed() < Duration::from_millis(500) {
-                if let Some(f) = capture.read_frame() {
-                    frame_opt = Some(f);
-                    break;
+            thread::sleep(Duration::from_millis(50));
+            let frame = match capture.read_captured_frame() {
+                Some(f) => f.image,
+                None => {
+                    capture.stop();
+                    return ("NO_FACE".to_string(), None, Vec::new());
                 }
-                thread::sleep(Duration::from_millis(20));
-            }
-            capture.stop();
-
-            let frame = match frame_opt {
-                Some(f) => f,
-                None => return ("NO_FACE".to_string(), None, Vec::new()),
             };
+            capture.stop();
 
             let det_res = match detector.detect_detailed(&frame) {
                 Ok(d) => d,
@@ -384,7 +377,11 @@ impl SentinelService {
                 return ("FACE_TOO_SMALL".to_string(), None, Vec::new());
             }
 
-            let mut lm_vec = Vec::with_capacity(10);
+            let mut lm_vec = Vec::with_capacity(14);
+            lm_vec.push(det.bbox[0] as f64);
+            lm_vec.push(det.bbox[1] as f64);
+            lm_vec.push(det.bbox[2] as f64);
+            lm_vec.push(det.bbox[3] as f64);
             for p in &det.landmarks {
                 lm_vec.push(p[0] as f64);
                 lm_vec.push(p[1] as f64);
@@ -418,9 +415,6 @@ impl SentinelService {
 
                 s.collected_embeddings.push(emb);
                 s.pose_index += 1;
-                if s.pose_index >= s.total_poses {
-                    return Ok(("COMPLETE".to_string(), s.pose_index as i32, s.total_poses as i32, lm_vec));
-                }
             }
             Ok((status_str, s.pose_index as i32, s.total_poses as i32, lm_vec))
         } else {
@@ -437,12 +431,7 @@ impl SentinelService {
         let (_pose_idx, _total_poses) = {
             let lock = self.active_enrollment.lock().unwrap();
             match lock.as_ref() {
-                Some(s) if s.session_id == session_id => {
-                    if s.pose_index >= s.total_poses {
-                        return Ok(("COMPLETE".to_string(), s.pose_index as i32, s.total_poses as i32, Vec::new()));
-                    }
-                    (s.pose_index, s.total_poses)
-                }
+                Some(s) if s.session_id == session_id => (s.pose_index, s.total_poses),
                 _ => return Ok(("NO_SESSION".to_string(), 0, 30, Vec::new())),
             }
         };
@@ -517,9 +506,6 @@ impl SentinelService {
             if let Some(emb) = emb_opt {
                 s.collected_embeddings.push(emb);
                 s.pose_index += 1;
-                if s.pose_index >= s.total_poses {
-                    return Ok(("COMPLETE".to_string(), s.pose_index as i32, s.total_poses as i32, bbox_lm_vec));
-                }
             }
             Ok((status_str, s.pose_index as i32, s.total_poses as i32, bbox_lm_vec))
         } else {
@@ -540,8 +526,14 @@ impl SentinelService {
             }
         };
 
-        if session.collected_embeddings.is_empty() {
-            return Ok((false, "No embeddings collected".to_string()));
+        if session.collected_embeddings.len() < 15 {
+            return Ok((
+                false,
+                format!(
+                    "Insufficient embeddings: collected {} (minimum 15 required)",
+                    session.collected_embeddings.len()
+                ),
+            ));
         }
 
         let store = GalleryStore::new(&session.username);
@@ -557,6 +549,25 @@ impl SentinelService {
                 session.collected_embeddings.len()
             ),
         ))
+    }
+
+    async fn get_recent_auth_log(&self, lines: u32) -> zbus::fdo::Result<Vec<String>> {
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let log_path = format!("/var/log/sentinel/auth_{}.log", today);
+
+        let content = std::fs::read_to_string(&log_path).unwrap_or_default();
+
+        let result: Vec<String> = content
+            .lines()
+            .rev()
+            .take(lines as usize)
+            .map(String::from)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+
+        Ok(result)
     }
 
     async fn cancel_enrollment(
