@@ -1,0 +1,14 @@
+[Unit]
+Description=Sentinel Recreated Face Authentication Daemon
+After=network.target dbus.service
+Before=greetd.service display-manager.service
+
+[Service]
+Type=dbus
+BusName=com.sentinel.Sentinel
+ExecStart=/usr/local/bin/sentinel-daemon --config /etc/sentinel/config.toml
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

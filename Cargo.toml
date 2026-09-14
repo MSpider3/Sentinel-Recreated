@@ -1,0 +1,5 @@
+[workspace]
+members = [
+    "sentinel-core",
+]
+resolver = "2"
