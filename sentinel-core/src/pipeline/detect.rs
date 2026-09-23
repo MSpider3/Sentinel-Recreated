@@ -81,9 +81,26 @@ impl ScrfdDetector {
         Ok(res.detections)
     }
 
+    pub fn is_valid_frame_size(width: u32, height: u32) -> bool {
+        const MAX_DIM: u32 = 8192;
+        width >= 1 && height >= 1 && width <= MAX_DIM && height <= MAX_DIM
+    }
+
     pub fn detect_detailed(&mut self, frame: &RgbImage) -> Result<ScrfdResult> {
         let orig_width = frame.width() as f32;
         let orig_height = frame.height() as f32;
+
+        // Reject frames whose dimensions can amplify the separable resize
+        // intermediate (source_width * input_size * 16 bytes, Rgba32F) beyond
+        // a bounded budget. Legitimate camera frames are <= 4K-class; the
+        // 8192 cap bounds the intermediate at ~84 MB.
+        const MAX_DIM: u32 = 8192;
+        if frame.width() > MAX_DIM || frame.height() > MAX_DIM {
+            return Ok(ScrfdResult {
+                detections: Vec::new(),
+                raw_candidates: Vec::new(),
+            });
+        }
 
         if orig_width < 1.0 || orig_height < 1.0 {
             return Ok(ScrfdResult {
@@ -306,5 +323,15 @@ mod tests {
                 println!("Detection {}: score={:.3}, bbox={:?}", idx, det.score, det.bbox);
             }
         }
+    }
+
+    #[test]
+    fn test_oversized_frame_dimension_cap() {
+        assert!(!ScrfdDetector::is_valid_frame_size(8193, 100));
+        assert!(!ScrfdDetector::is_valid_frame_size(100, 8193));
+        assert!(!ScrfdDetector::is_valid_frame_size(0, 100));
+        assert!(!ScrfdDetector::is_valid_frame_size(100, 0));
+        assert!(ScrfdDetector::is_valid_frame_size(640, 480));
+        assert!(ScrfdDetector::is_valid_frame_size(8192, 8192));
     }
 }

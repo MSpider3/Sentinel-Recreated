@@ -22,7 +22,8 @@ path = "src/lib.rs"
 [dependencies]
 ort = { version = "2.0.0-rc.9", features = ["download-binaries"] }
 ndarray = "0.17"
-image = { version = "0.25", features = ["jpeg", "png"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+libc = "0.2"
 gstreamer = "0.23"
 gstreamer-app = "0.23"
 gstreamer-video = "0.23"

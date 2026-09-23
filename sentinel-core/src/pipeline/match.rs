@@ -71,8 +71,8 @@ mod tests {
 
     #[test]
     fn test_tier_boundaries() {
-        assert_eq!(decide_tier(0.24), AuthTier::Golden);
-        assert_eq!(decide_tier(0.25), AuthTier::Standard);
+        assert_eq!(decide_tier(0.27), AuthTier::Golden);
+        assert_eq!(decide_tier(0.28), AuthTier::Standard);
         assert_eq!(decide_tier(0.41), AuthTier::Standard);
         assert_eq!(decide_tier(0.42), AuthTier::TwoFactor);
         assert_eq!(decide_tier(0.50), AuthTier::TwoFactor);

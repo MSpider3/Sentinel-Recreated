@@ -82,6 +82,12 @@ pub struct SecurityConfig {
     #[serde(default = "default_global_session_timeout")]
     pub global_session_timeout: f64,
     pub gallery_max_size: usize,
+    #[serde(default = "default_require_liveness")]
+    pub require_liveness: bool,
+}
+
+fn default_require_liveness() -> bool {
+    false
 }
 
 fn default_recognition_threshold() -> f32 {
@@ -114,6 +120,7 @@ impl Default for SecurityConfig {
             challenge_timeout_secs: 20.0,
             global_session_timeout: 25.0,
             gallery_max_size: 20,
+            require_liveness: false,
         }
     }
 }
@@ -171,5 +178,30 @@ impl SentinelConfig {
         let config: SentinelConfig = toml::from_str(&content)
             .with_context(|| format!("Failed to parse TOML config from: {}", p.display()))?;
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_require_liveness_config_parsing() {
+        let default_cfg = SentinelConfig::default();
+        assert!(!default_cfg.security.require_liveness);
+
+        let toml_str = r#"
+[security]
+golden_threshold = 0.28
+standard_threshold = 0.42
+two_factor_threshold = 0.50
+spoof_threshold = 0.70
+max_retries = 3
+challenge_timeout_secs = 20.0
+gallery_max_size = 20
+require_liveness = true
+"#;
+        let parsed: SentinelConfig = toml::from_str(toml_str).unwrap();
+        assert!(parsed.security.require_liveness);
     }
 }

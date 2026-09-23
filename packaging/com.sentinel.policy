@@ -47,6 +47,16 @@
     </defaults>
   </action>
 
+  <action id="com.sentinel.dismiss_intrusion">
+    <description>Dismiss (delete) an intruder capture log screenshot</description>
+    <message>Administrative authorization is required to delete intrusion log screenshots.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+  </action>
+
   <action id="com.sentinel.reset_calibration">
     <description>Reset and run MiniFASNet anti-spoof calibration</description>
     <message>Authentication is required to calibrate anti-spoof security parameters.</message>
@@ -54,6 +64,16 @@
       <allow_any>auth_admin</allow_any>
       <allow_inactive>auth_admin</allow_inactive>
       <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="com.sentinel.get_auth_log">
+    <description>Read the biometric authentication audit history</description>
+    <message>Administrative authorization is required to view the authentication audit log.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
     </defaults>
   </action>
 

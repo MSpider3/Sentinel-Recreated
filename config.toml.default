@@ -22,6 +22,7 @@ max_retries = 3
 challenge_timeout_secs = 20.0
 global_session_timeout = 25.0
 gallery_max_size = 20
+require_liveness = false
 
 [storage]
 data_dir = "/var/lib/sentinel"

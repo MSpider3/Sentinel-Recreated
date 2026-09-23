@@ -22,7 +22,10 @@ systemctl daemon-reload
 
 echo "[2/7] Removing daemon binary & PAM module..."
 rm -f /usr/local/bin/sentinel-daemon
-rm -f /usr/lib64/security/pam_sentinel.so
+rm -f /usr/lib64/security/pam_sentinel.so \
+      /usr/lib/x86_64-linux-gnu/security/pam_sentinel.so \
+      /usr/lib/aarch64-linux-gnu/security/pam_sentinel.so \
+      /usr/lib/security/pam_sentinel.so
 
 echo "[3/7] Cleaning up PAM configurations..."
 PAM_FILES=(

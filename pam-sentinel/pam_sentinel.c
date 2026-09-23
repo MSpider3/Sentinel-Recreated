@@ -2,6 +2,7 @@
  * Zero biometric logic. Calls com.sentinel.Sentinel.Authenticate via libdbus-1.
  * Spec: docs/PAM_INTEGRATION.md  Constraint: < 200 lines C99. */
 
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/types.h>
@@ -12,7 +13,7 @@
 #define SENTINEL_BUS  "com.sentinel.Sentinel"
 #define SENTINEL_PATH "/com/sentinel/Sentinel"
 #define SENTINEL_IFACE "com.sentinel.Sentinel"
-#define SENTINEL_DBUS_TIMEOUT_MS 8000
+#define SENTINEL_DBUS_TIMEOUT_MS 5000
 
 static int sentinel_reachable(DBusConnection *c)
 {
@@ -101,6 +102,48 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
 {
     (void)flags; (void)argc; (void)argv;
 
+    /* Fail-Safe 1: If password was already supplied (e.g., entered in lock
+     * screen password field or supplied by earlier module), do not intercept
+     * or prompt. Step aside immediately so standard auth completes. */
+    const void *authtok = NULL;
+    if (pam_get_item(pamh, PAM_AUTHTOK, &authtok) == PAM_SUCCESS && authtok != NULL) {
+        return PAM_IGNORE;
+    }
+
+    /* 0. Consent / attention gate — biometric presence is not consent.
+     * Demand one interactive round-trip (an Enter press) before the camera
+     * is engaged, so every grant is bound to a human who saw that an
+     * authentication event was requested for the invoking context.
+     * Non-interactive callers (sudo -n, cron, background daemons) cannot
+     * answer a prompt: their conversation fails and we step aside
+     * (PAM_IGNORE), letting the stack fall through to password auth.
+     *
+     * Fail-Safe 2: If the user typed their password into this prompt instead
+     * of pressing Enter, we preserve it in PAM_AUTHTOK and return PAM_IGNORE
+     * so pam_unix can authenticate it immediately without requiring re-entry. */
+    const struct pam_conv *conv = NULL;
+    if (pam_get_item(pamh, PAM_CONV, (const void **)&conv) != PAM_SUCCESS
+        || conv == NULL || conv->conv == NULL)
+        return PAM_IGNORE;
+    struct pam_message cmsg;
+    memset(&cmsg, 0, sizeof(cmsg));
+    cmsg.msg_style = PAM_PROMPT_ECHO_OFF;
+    cmsg.msg = "Sentinel face authentication requested - press Enter to scan (or enter password): ";
+    const struct pam_message *cmsgp = &cmsg;
+    struct pam_response *cresp = NULL;
+    int crc = conv->conv(1, &cmsgp, &cresp, conv->appdata_ptr);
+    if (crc != PAM_SUCCESS) {
+        if (cresp) { free(cresp->resp); free(cresp); }
+        return PAM_IGNORE; /* non-interactive caller or cancelled: never lock out */
+    }
+    if (cresp && cresp->resp && cresp->resp[0] != '\0') {
+        /* User typed a password rather than empty Enter — pass it forward to pam_unix */
+        pam_set_item(pamh, PAM_AUTHTOK, cresp->resp);
+        free(cresp->resp); free(cresp);
+        return PAM_IGNORE;
+    }
+    if (cresp) { free(cresp->resp); free(cresp); }
+
     /* 1. Get username — use exactly what PAM (greetd) reports; do NOT
      *    override with getuid() which returns root when greetd calls us. */
     const char *user = NULL;
@@ -119,9 +162,10 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
         return PAM_IGNORE;
     }
 
-    /* 4. Collect SSH env context */
-    const char *ssh_c = pam_getenv(pamh, "SSH_CLIENT");
-    const char *ssh_t = pam_getenv(pamh, "SSH_TTY");
+    /* 4. Collect SSH context from the *process* environment: the PAM env
+     * is only written by pam_putenv(), which no real caller performs. */
+    const char *ssh_c = getenv("SSH_CLIENT");
+    const char *ssh_t = getenv("SSH_TTY");
 
     /* 5. Call Authenticate(username, session_env) */
     const char *result = sentinel_call(conn, user, ssh_c, ssh_t);
@@ -134,55 +178,21 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
 
     /* 7. Map daemon result string → PAM return code.
      *
-     * Semantic distinction:
-     *   PAM_IGNORE   = "I have no opinion" — infrastructure not available or
-     *                  no face was ever presented.  PAM silently falls through
-     *                  to the next module (pam_unix.so → password prompt).
-     *   PAM_AUTH_ERR = "I tried and it failed" — the daemon actively attempted
-     *                  recognition but could not grant access.  PAM shows an
-     *                  "authentication failed" notice before the password prompt,
-     *                  giving the user clear feedback that face auth was attempted.
+     * FAIL-SAFE GUARANTEE:
+     * Only an explicit "GRANTED" recognition result satisfies PAM with PAM_SUCCESS.
+     * Every other outcome ("NO_FACE", "TIMEOUT", "DENIED", "SPOOF", "REQUIRE_2FA",
+     * or any unknown status/error) returns PAM_IGNORE.
      *
-     * Rule of thumb: if a camera session was opened and a face was involved,
-     * use PAM_AUTH_ERR.  If the camera never meaningfully engaged, use PAM_IGNORE.
+     * Why PAM_IGNORE for all non-granted cases?
+     * Because returning PAM_AUTH_ERR can cause pam_faillock / pam_tally2 to record
+     * failed attempts and lock out user accounts from password login. Returning
+     * PAM_IGNORE guarantees that the PAM stack safely, transparently falls through
+     * to standard password authentication (pam_unix.so). Biometric failures can
+     * NEVER lock a user out of their own machine.
      */
     if (!strcmp(result, "GRANTED"))
-        /* Face matched — unlock immediately. */
         return PAM_SUCCESS;
 
-    if (!strcmp(result, "NO_FACE"))
-        /* Daemon found no face in the field of view (camera opened but no
-         * subject detected, or user walked away before detection).  No
-         * recognition was attempted — silently fall through to password. */
-        return PAM_IGNORE;
-
-    if (!strcmp(result, "TIMEOUT"))
-        /* Camera was open and a liveness session ran, but the user did not
-         * complete the challenge within the time limit.  This is an active
-         * failure: return PAM_AUTH_ERR so the lock screen shows a failure
-         * notice before falling through to the password prompt.  This is the
-         * correct UX — the user sees that face auth was attempted and expired,
-         * then gets a clean password prompt rather than a silent transition. */
-        return PAM_AUTH_ERR;
-
-    if (!strcmp(result, "DENIED"))
-        /* Face was detected and recognised but distance exceeded all thresholds.
-         * Active failure — password prompt with failure notice. */
-        return PAM_AUTH_ERR;
-
-    if (!strcmp(result, "SPOOF"))
-        /* Anti-spoof classifier rejected the presentation.  Active security
-         * failure — password prompt with failure notice. */
-        return PAM_AUTH_ERR;
-
-    if (!strcmp(result, "REQUIRE_2FA"))
-        /* Biometric passed at Tier 3 but policy requires a second factor.
-         * Fall through to pam_unix.so so the user can supply their password
-         * as the second factor.  PAM_AUTH_ERR triggers the prompt correctly. */
-        return PAM_AUTH_ERR;
-
-    /* Unknown / future result token or malformed payload.
-     * Treat as infrastructure uncertainty — transparent fallback. */
     return PAM_IGNORE;
 }
 

@@ -565,8 +565,8 @@ impl SentinelAuthenticator {
                                     }
                                 }
 
-                                // Tier 1 (Golden: d < 0.28): Skip head pose and blink challenges, grant access immediately.
-                                if active_tier == ActiveTier::Golden {
+                                // Tier 1 (Golden: d < 0.28): Skip head pose and blink challenges unless require_liveness is enabled
+                                if active_tier == ActiveTier::Golden && !self.config.security.require_liveness {
                                     println!(
                                         "[Auth] GOLDEN match (d={:.4}) — granting access immediately after spoof check.",
                                         dist
@@ -632,6 +632,75 @@ impl SentinelAuthenticator {
         // STATE: RECOGNIZED — head-pose challenge then blink
         // ─────────────────────────────────────────────────────────────────────
         if self.state == AuthState::Recognized {
+            // Re-verify the subject on the CURRENT frame before trusting any
+            // challenge progress. The identity decision was made on a single
+            // Waiting-state frame; without this check the face in front of the
+            // camera can be swapped for any other moving presentation while the
+            // challenge machinery completes and grants `matched_user`.
+            {
+                let det_with_kps = detections.iter().find(|d| {
+                    (d.bbox[0] - bbox[0]).abs() < 5.0 && (d.bbox[1] - bbox[1]).abs() < 5.0
+                });
+
+                let mut subject_ok = false;
+
+                if let Some(det) = det_with_kps {
+                    if let Ok(aligned) = align_face(frame, &det.landmarks) {
+                        if let Ok(embedding) = self.embedder.embed(&aligned) {
+                            if !self.blacklist_mgr.check(&embedding) {
+                                let (_dist, tier) = match_gallery_with_config(
+                                    &embedding,
+                                    &self.gallery,
+                                    &self.config.security,
+                                );
+                                // The subject must still match the gallery at a
+                                // grantable tier (Golden or Standard).
+                                let tier_ok = match ActiveTier::from_auth_tier(&tier) {
+                                    Some(ActiveTier::Golden) | Some(ActiveTier::Standard) => true,
+                                    _ => false,
+                                };
+                                // The spoof verdict must hold for the challenge
+                                // frames too, and fails CLOSED here if spoof detector is active.
+                                let spoof_ok = if let Some(ref mut spoof) = self.spoof {
+                                    match SpoofDetector::square_crop(frame, bbox, 1.5) {
+                                        Ok(crop) => match spoof.predict(&crop) {
+                                            Ok((_is_real, confidence)) => {
+                                                self.last_spoof_score = Some(confidence);
+                                                let spoof_threshold = match self.active_tier {
+                                                    Some(ActiveTier::Golden) => {
+                                                        self.config.security.spoof_threshold_golden
+                                                    }
+                                                    _ => self.config.security.spoof_threshold_standard,
+                                                };
+                                                confidence >= spoof_threshold
+                                            }
+                                            Err(_) => false,
+                                        },
+                                        Err(_) => false,
+                                    }
+                                } else {
+                                    true
+                                };
+                                subject_ok = tier_ok && spoof_ok;
+                            }
+                        }
+                    }
+                }
+
+                if !subject_ok {
+                    self.retry_count += 1;
+                    let remaining = MAX_RETRIES.saturating_sub(self.retry_count);
+                    println!(
+                        "[Auth] Subject changed during challenge — aborting. Retries left: {}",
+                        remaining
+                    );
+                    self.log_audit("DENIED", self.active_tier_num(), "SUBJECT_CHANGED");
+                    self.reset(true);
+                    self.message = format!("Subject changed! Attempts left: {}", remaining);
+                    return Ok(self.make_result(Some(bbox)));
+                }
+            }
+
             let lv = match self.liveness.as_mut() {
                 Some(l) => l,
                 None => {

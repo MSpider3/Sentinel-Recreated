@@ -2,6 +2,8 @@
 Description=Sentinel Recreated Face Authentication Daemon
 After=network.target dbus.service
 Before=greetd.service display-manager.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=dbus
@@ -9,6 +11,22 @@ BusName=com.sentinel.Sentinel
 ExecStart=/usr/local/bin/sentinel-daemon --config /etc/sentinel/config.toml
 Restart=on-failure
 RestartSec=3
+
+# Resource limits
+MemoryMax=4G
+MemoryHigh=3G
+
+# System protection and sandbox
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/sentinel /var/log/sentinel
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+PrivateTmp=true
+NoNewPrivileges=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
 
 [Install]
 WantedBy=multi-user.target

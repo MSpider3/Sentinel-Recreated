@@ -4,7 +4,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use image::RgbImage;
 use zbus::zvariant;
 
 use crate::config::SentinelConfig;
@@ -16,11 +15,16 @@ use crate::pipeline::{
 
 pub struct EnrollmentSession {
     pub session_id: String,
+    pub owner: String,
+    pub created_at: Instant,
     pub username: String,
     pub pose_index: usize,
     pub total_poses: usize,
     pub collected_embeddings: Vec<[f32; 512]>,
 }
+
+/// Maximum lifetime of an enrollment session (interactive wizard budget).
+pub const ENROLLMENT_SESSION_TTL: Duration = Duration::from_secs(1800);
 
 pub struct SentinelService {
     pub config: Arc<Mutex<SentinelConfig>>,
@@ -48,6 +52,26 @@ impl SentinelService {
             active_enrollment: Arc::new(Mutex::new(None)),
             rt_handle,
         }
+    }
+
+    pub fn is_session_valid(
+        session: &EnrollmentSession,
+        caller_sender: Option<&str>,
+        session_id: &str,
+    ) -> bool {
+        caller_sender == Some(session.owner.as_str())
+            && session.session_id == session_id
+            && session.created_at.elapsed() <= ENROLLMENT_SESSION_TTL
+    }
+
+    fn enrollment_session_owned(
+        &self,
+        session: &EnrollmentSession,
+        header: &zbus::MessageHeader<'_>,
+        session_id: &str,
+    ) -> bool {
+        let sender = header.sender().map(|s| s.to_string());
+        Self::is_session_valid(session, sender.as_deref(), session_id)
     }
 }
 
@@ -110,16 +134,82 @@ async fn check_polkit(
     }
 }
 
+/// DBus-supplied usernames are interpolated verbatim into root-owned filesystem
+/// paths (`/var/lib/sentinel/users/{}/` via `format!` in `GalleryStore::new` /
+/// `AdaptiveGallery::meta_path`), so any path metacharacter in a username turns
+/// an unprivileged caller into a root file read/write primitive. Only plain
+/// account names may reach the store layer.
+fn validate_username(username: &str) -> Result<(), String> {
+    let invalid = username.is_empty()
+        || username.contains('/')
+        || username.contains('\\')
+        || username.contains("..")
+        || username.starts_with('.');
+    if invalid {
+        Err(format!("Rejected unsafe username: {:?}", username))
+    } else {
+        Ok(())
+    }
+}
+
+/// Resolve a username to its numeric uid, used to bind the DBus method
+/// `Authenticate` to the identity it is asked to verify.
+fn uid_of_user(username: &str) -> Option<u32> {
+    use std::ffi::CString;
+    let c_name = CString::new(username).ok()?;
+    unsafe {
+        let pw = libc::getpwnam(c_name.as_ptr());
+        if pw.is_null() {
+            None
+        } else {
+            Some((*pw).pw_uid)
+        }
+    }
+}
+
 #[zbus::interface(name = "com.sentinel.Sentinel")]
 impl SentinelService {
     /// Primary authentication method invoked by pam_sentinel.so
     async fn authenticate(
         &self,
-        #[zbus(header)] _header: zbus::MessageHeader<'_>,
+        #[zbus(header)] header: zbus::MessageHeader<'_>,
         #[zbus(signal_context)] ctxt: zbus::SignalContext<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
         username: String,
         session_env: HashMap<String, String>,
     ) -> zbus::fdo::Result<(String, f64, i32)> {
+        if let Err(e) = validate_username(&username) {
+            return Err(zbus::fdo::Error::Failed(e));
+        }
+
+        // 0. Sender/subject binding: only the named user — or root, the uid
+        //    that gdm-session-worker / greetd / sudo / su / login run PAM
+        //    conversations as — may run biometric matching for that
+        //    identity. Without this, any local sender can use Authenticate
+        //    as an unlimited cross-user similarity/presence oracle against
+        //    every enrolled gallery.
+        let sender = header
+            .sender()
+            .ok_or_else(|| zbus::fdo::Error::Failed("Missing DBus sender".to_string()))?;
+        let caller_uid: u32 = zbus::Proxy::new(
+            conn,
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+        )
+        .await?
+        .call("GetConnectionUnixUser", &(sender.as_str()))
+        .await
+        .map_err(|e| zbus::fdo::Error::Failed(format!("GetConnectionUnixUser error: {}", e)))?;
+        let target_uid = uid_of_user(&username)
+            .ok_or_else(|| zbus::fdo::Error::Failed(format!("Unknown user '{}'", username)))?;
+        if caller_uid != 0 && caller_uid != target_uid {
+            return Err(zbus::fdo::Error::AccessDenied(format!(
+                "Caller (uid {}) is not authorized to authenticate as '{}'",
+                caller_uid, username
+            )));
+        }
+
         // 1. Session Context Evaluation (SSH / Lid check)
         if session_env.contains_key("SSH_CLIENT") || session_env.contains_key("SSH_TTY") {
             println!("[DBus] Remote SSH session detected for user '{}' — bypassing camera.", username);
@@ -142,10 +232,10 @@ impl SentinelService {
         })?;
 
         if gallery.is_empty() {
-            println!("[DBus] No enrolled gallery vectors for user '{}'.", username);
-            *self.last_auth_result.lock().unwrap() = "DENIED (No Enrolled Template)".to_string();
-            let _ = Self::auth_status_changed(&ctxt, "DENIED", "No enrolled template").await;
-            return Ok(("DENIED".to_string(), 1.0, 4));
+            println!("[DBus] No enrolled gallery vectors for user '{}' — failing open-safe.", username);
+            *self.last_auth_result.lock().unwrap() = "NO_FACE (No Enrolled Template)".to_string();
+            let _ = Self::auth_status_changed(&ctxt, "NO_FACE", "No enrolled template").await;
+            return Ok(("NO_FACE".to_string(), -1.0, 0));
         }
 
         let _ = Self::auth_status_changed(&ctxt, "CALIBRATING", "Initializing camera and models...").await;
@@ -160,7 +250,8 @@ impl SentinelService {
             let minifas_path = models_dir.join("MiniFASNetV2.onnx");
 
             if !scrfd_path.exists() || !mfn_path.exists() {
-                return ("DENIED".to_string(), 1.0, 4);
+                eprintln!("[DBus Authenticate] ONNX models missing — failing open-safe.");
+                return ("NO_FACE".to_string(), -1.0, 0);
             }
 
             let detector = match ScrfdDetector::new_with_input_size(
@@ -171,12 +262,18 @@ impl SentinelService {
                 config.detection.scrfd_input_size,
             ) {
                 Ok(d) => d,
-                Err(_) => return ("DENIED".to_string(), 1.0, 4),
+                Err(e) => {
+                    eprintln!("[DBus Authenticate] Detector init error: {} — failing open-safe.", e);
+                    return ("NO_FACE".to_string(), -1.0, 0);
+                }
             };
 
             let embedder = match MobileFaceNet::new(mfn_path.to_str().unwrap()) {
                 Ok(e) => e,
-                Err(_) => return ("DENIED".to_string(), 1.0, 4),
+                Err(e) => {
+                    eprintln!("[DBus Authenticate] Embedder init error: {} — failing open-safe.", e);
+                    return ("NO_FACE".to_string(), -1.0, 0);
+                }
             };
 
             let spoof = if minifas_path.exists() {
@@ -202,14 +299,14 @@ impl SentinelService {
             let mut capture = match FrameCapture::new(&config.camera.source) {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("[DBus Authenticate] FrameCapture init error: {}", e);
-                    return ("DENIED".to_string(), 1.0, 4);
+                    eprintln!("[DBus Authenticate] FrameCapture init error: {} — failing open-safe.", e);
+                    return ("NO_FACE".to_string(), -1.0, 0);
                 }
             };
 
             if let Err(e) = capture.start() {
-                eprintln!("[DBus Authenticate] FrameCapture start error: {}", e);
-                return ("DENIED".to_string(), 1.0, 4);
+                eprintln!("[DBus Authenticate] FrameCapture start error: {} — failing open-safe.", e);
+                return ("NO_FACE".to_string(), -1.0, 0);
             }
 
             let start_time = Instant::now();
@@ -239,7 +336,11 @@ impl SentinelService {
                     Ok(r) => match r.state {
                         AuthState::Success => {
                             capture.stop();
-                            let dist = r.distance.unwrap_or(0.0) as f64;
+                            // Constant: never return the measured distance to
+                            // the caller — it is a similarity oracle against
+                            // the target user's templates (pam_sentinel
+                            // ignores the value).
+                            let dist = 0.0;
                             let tier = match r.active_tier {
                                 Some(ActiveTier::Golden) => 1,
                                 Some(ActiveTier::Standard) => 2,
@@ -250,14 +351,16 @@ impl SentinelService {
                         }
                         AuthState::Failure => {
                             capture.stop();
-                            let dist = r.distance.unwrap_or(1.0) as f64;
+                            // Constant: never return the measured distance.
+                            let dist = 1.0;
                             let is_spoof = r.message.to_lowercase().contains("spoof");
                             let res = if is_spoof { "SPOOF" } else { "DENIED" };
                             return (res.to_string(), dist, 4);
                         }
                         AuthState::Require2FA => {
                             capture.stop();
-                            let dist = r.distance.unwrap_or(0.45) as f64;
+                            // Constant: never return the measured distance.
+                            let dist = 0.45;
                             return ("REQUIRE_2FA".to_string(), dist, 3);
                         }
                         AuthState::NoFace => {
@@ -289,10 +392,19 @@ impl SentinelService {
         username: String,
     ) -> zbus::fdo::Result<String> {
         check_polkit(conn, &header, "com.sentinel.enroll").await?;
+        if let Err(e) = validate_username(&username) {
+            return Err(zbus::fdo::Error::Failed(e));
+        }
 
-        let session_id = format!("enroll_{}_{}", username, Instant::now().elapsed().as_millis());
+        let owner = header
+            .sender()
+            .ok_or_else(|| zbus::fdo::Error::Failed("Missing DBus sender".to_string()))?
+            .to_string();
+        let session_id = generate_enrollment_session_id(&username);
         let session = EnrollmentSession {
             session_id: session_id.clone(),
+            owner,
+            created_at: Instant::now(),
             username,
             pose_index: 0,
             total_poses: 30,
@@ -305,13 +417,15 @@ impl SentinelService {
 
     async fn submit_enrollment_frame(
         &self,
-        #[zbus(header)] _header: zbus::MessageHeader<'_>,
+        #[zbus(header)] header: zbus::MessageHeader<'_>,
         session_id: String,
     ) -> zbus::fdo::Result<(String, i32, i32, Vec<f64>)> {
         let (_pose_idx, _total_poses) = {
             let lock = self.active_enrollment.lock().unwrap();
             match lock.as_ref() {
-                Some(s) if s.session_id == session_id => (s.pose_index, s.total_poses),
+                Some(s) if self.enrollment_session_owned(s, &header, &session_id) => {
+                    (s.pose_index, s.total_poses)
+                }
                 _ => return Ok(("NO_SESSION".to_string(), 0, 30, Vec::new())),
             }
         };
@@ -400,7 +514,10 @@ impl SentinelService {
 
         let (status_str, emb_opt, lm_vec) = res;
         let mut lock = self.active_enrollment.lock().unwrap();
-        if let Some(s) = lock.as_mut().filter(|s| s.session_id == session_id) {
+        if let Some(s) = lock
+            .as_mut()
+            .filter(|s| self.enrollment_session_owned(s, &header, &session_id))
+        {
             if let Some(emb) = emb_opt {
                 // Daemon-side diversity check: cosine distance > 0.05 against existing embeddings
                 let is_too_similar = s.collected_embeddings.iter().any(|existing| {
@@ -424,14 +541,16 @@ impl SentinelService {
 
     async fn submit_enrollment_frame_data(
         &self,
-        #[zbus(header)] _header: zbus::MessageHeader<'_>,
+        #[zbus(header)] header: zbus::MessageHeader<'_>,
         session_id: String,
         frame_data: Vec<u8>,
     ) -> zbus::fdo::Result<(String, i32, i32, Vec<f64>)> {
         let (_pose_idx, _total_poses) = {
             let lock = self.active_enrollment.lock().unwrap();
             match lock.as_ref() {
-                Some(s) if s.session_id == session_id => (s.pose_index, s.total_poses),
+                Some(s) if self.enrollment_session_owned(s, &header, &session_id) => {
+                    (s.pose_index, s.total_poses)
+                }
                 _ => return Ok(("NO_SESSION".to_string(), 0, 30, Vec::new())),
             }
         };
@@ -502,7 +621,10 @@ impl SentinelService {
 
         let (status_str, emb_opt, bbox_lm_vec) = res;
         let mut lock = self.active_enrollment.lock().unwrap();
-        if let Some(s) = lock.as_mut().filter(|s| s.session_id == session_id) {
+        if let Some(s) = lock
+            .as_mut()
+            .filter(|s| self.enrollment_session_owned(s, &header, &session_id))
+        {
             if let Some(emb) = emb_opt {
                 s.collected_embeddings.push(emb);
                 s.pose_index += 1;
@@ -515,14 +637,19 @@ impl SentinelService {
 
     async fn finish_enrollment(
         &self,
-        #[zbus(header)] _header: zbus::MessageHeader<'_>,
+        #[zbus(header)] header: zbus::MessageHeader<'_>,
         session_id: String,
     ) -> zbus::fdo::Result<(bool, String)> {
         let session = {
             let mut lock = self.active_enrollment.lock().unwrap();
-            match lock.take() {
-                Some(s) if s.session_id == session_id => s,
-                _ => return Ok((false, "Session not found or expired".to_string())),
+            let matches = lock
+                .as_ref()
+                .map(|s| self.enrollment_session_owned(s, &header, &session_id))
+                .unwrap_or(false);
+            if matches {
+                lock.take().unwrap()
+            } else {
+                return Ok((false, "Session not found or expired".to_string()));
             }
         };
 
@@ -551,7 +678,13 @@ impl SentinelService {
         ))
     }
 
-    async fn get_recent_auth_log(&self, lines: u32) -> zbus::fdo::Result<Vec<String>> {
+    async fn get_recent_auth_log(
+        &self,
+        #[zbus(header)] header: zbus::MessageHeader<'_>,
+        #[zbus(connection)] conn: &zbus::Connection,
+        lines: u32,
+    ) -> zbus::fdo::Result<Vec<String>> {
+        check_polkit(conn, &header, "com.sentinel.get_auth_log").await?;
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let log_path = format!("/var/log/sentinel/auth_{}.log", today);
 
@@ -572,12 +705,12 @@ impl SentinelService {
 
     async fn cancel_enrollment(
         &self,
-        #[zbus(header)] _header: zbus::MessageHeader<'_>,
+        #[zbus(header)] header: zbus::MessageHeader<'_>,
         session_id: String,
     ) -> zbus::fdo::Result<()> {
         let mut lock = self.active_enrollment.lock().unwrap();
         if let Some(ref s) = *lock {
-            if s.session_id == session_id {
+            if self.enrollment_session_owned(s, &header, &session_id) {
                 *lock = None;
             }
         }
@@ -606,6 +739,9 @@ impl SentinelService {
         username: String,
     ) -> zbus::fdo::Result<bool> {
         check_polkit(conn, &header, "com.sentinel.remove_user").await?;
+        if let Err(e) = validate_username(&username) {
+            return Err(zbus::fdo::Error::Failed(e));
+        }
 
         let user_dir = PathBuf::from("/var/lib/sentinel/users").join(&username);
         if user_dir.exists() {
@@ -620,7 +756,28 @@ impl SentinelService {
     }
 
     async fn get_user_info(&self, username: String) -> zbus::fdo::Result<String> {
-        let meta_path = PathBuf::from("/var/lib/sentinel/users").join(&username).join("meta.json");
+        if let Err(e) = validate_username(&username) {
+            return Err(zbus::fdo::Error::InvalidArgs(e));
+        }
+
+        let base = std::fs::canonicalize("/var/lib/sentinel/users")
+            .unwrap_or_else(|_| PathBuf::from("/var/lib/sentinel/users"));
+        let meta_path = match std::fs::canonicalize(
+            PathBuf::from("/var/lib/sentinel/users").join(&username).join("meta.json"),
+        ) {
+            Ok(p) if p.starts_with(&base) => p,
+            _ => {
+                let default_meta = serde_json::json!({
+                    "username": username,
+                    "core_vector_count": 0,
+                    "adaptive_vector_count": 0,
+                    "last_adaptation_date": "N/A",
+                    "enrolled_at": "N/A"
+                });
+                return Ok(default_meta.to_string());
+            }
+        };
+
         if meta_path.exists() {
             match std::fs::read_to_string(&meta_path) {
                 Ok(content) => Ok(content),
@@ -729,7 +886,16 @@ impl SentinelService {
         #[zbus(connection)] conn: &zbus::Connection,
         filename: String,
     ) -> zbus::fdo::Result<()> {
-        check_polkit(conn, &header, "com.sentinel.get_intrusions").await?;
+        check_polkit(conn, &header, "com.sentinel.dismiss_intrusion").await?;
+
+        let mut components = std::path::Path::new(&filename).components();
+        let is_plain_name =
+            matches!(components.next(), Some(std::path::Component::Normal(_)))
+                && components.next().is_none()
+                && !filename.contains('\0');
+        if !is_plain_name {
+            return Err(zbus::fdo::Error::Failed("Invalid filename".to_string()));
+        }
 
         let file_path = PathBuf::from("/var/lib/sentinel/blacklist").join(filename);
         if file_path.exists() {
@@ -843,3 +1009,136 @@ impl SentinelService {
         message: &str,
     ) -> zbus::Result<()>;
 }
+
+fn generate_enrollment_session_id(username: &str) -> String {
+    let mut token = String::with_capacity(32);
+    for byte in rand::random::<[u8; 16]>() {
+        token.push_str(&format!("{:02x}", byte));
+    }
+    format!("enroll_{}_{}", username, token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_enrollment_session_id_entropy() {
+        let id1 = generate_enrollment_session_id("alice");
+        let id2 = generate_enrollment_session_id("alice");
+        assert_ne!(id1, id2, "Session IDs must be non-deterministic");
+        assert!(!id1.ends_with("_0"), "Session ID must not end with deterministic _0 timestamp");
+        assert!(id1.starts_with("enroll_alice_"));
+        let token = id1.strip_prefix("enroll_alice_").unwrap();
+        assert_eq!(token.len(), 32);
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_enrollment_session_sender_binding_and_ttl() {
+        let session = EnrollmentSession {
+            session_id: "enroll_alice_testtoken123".to_string(),
+            owner: ":1.42".to_string(),
+            created_at: Instant::now(),
+            username: "alice".to_string(),
+            pose_index: 0,
+            total_poses: 30,
+            collected_embeddings: Vec::new(),
+        };
+
+        // 1. Owner matches and ID matches -> valid
+        assert!(SentinelService::is_session_valid(&session, Some(":1.42"), "enroll_alice_testtoken123"));
+
+        // 2. Caller sender mismatch -> invalid (BUG-R2-S1-A1-H2)
+        assert!(!SentinelService::is_session_valid(&session, Some(":1.99"), "enroll_alice_testtoken123"));
+        assert!(!SentinelService::is_session_valid(&session, None, "enroll_alice_testtoken123"));
+
+        // 3. ID mismatch -> invalid
+        assert!(!SentinelService::is_session_valid(&session, Some(":1.42"), "enroll_alice_wrongid"));
+
+        // 4. Expired session (> 1800s) -> invalid (BUG-R2-S1-A1-H3)
+        let expired_session = EnrollmentSession {
+            session_id: "enroll_alice_testtoken123".to_string(),
+            owner: ":1.42".to_string(),
+            created_at: Instant::now() - Duration::from_secs(1801),
+            username: "alice".to_string(),
+            pose_index: 0,
+            total_poses: 30,
+            collected_embeddings: Vec::new(),
+        };
+        assert!(!SentinelService::is_session_valid(&expired_session, Some(":1.42"), "enroll_alice_testtoken123"));
+    }
+
+    #[test]
+    fn test_validate_username() {
+        assert!(validate_username("alice").is_ok());
+        assert!(validate_username("bob_123").is_ok());
+        assert!(validate_username("carol-dev").is_ok());
+
+        assert!(validate_username("").is_err());
+        assert!(validate_username("../../../../tmp/evil").is_err());
+        assert!(validate_username("/etc/shadow").is_err());
+        assert!(validate_username("..").is_err());
+        assert!(validate_username(".").is_err());
+        assert!(validate_username(".hidden").is_err());
+        assert!(validate_username("alice/bob").is_err());
+        assert!(validate_username("alice\\bob").is_err());
+    }
+
+    #[test]
+    fn test_uid_of_user() {
+        assert_eq!(uid_of_user("root"), Some(0));
+        assert_eq!(uid_of_user("nonexistent_user_xyz123"), None);
+    }
+
+    #[test]
+    fn test_is_plain_filename() {
+        let is_plain = |filename: &str| {
+            let mut components = std::path::Path::new(filename).components();
+            matches!(components.next(), Some(std::path::Component::Normal(_)))
+                && components.next().is_none()
+                && !filename.contains('\0')
+        };
+
+        assert!(is_plain("intrusion_20260923_120000.jpg"));
+        assert!(is_plain("capture.jpg"));
+
+        assert!(!is_plain("/etc/passwd"));
+        assert!(!is_plain("../evil.jpg"));
+        assert!(!is_plain("dir/file.jpg"));
+        assert!(!is_plain(""));
+        assert!(!is_plain("."));
+        assert!(!is_plain(".."));
+    }
+
+    #[test]
+    fn test_get_user_info_path_containment() {
+        // Path traversal usernames are rejected by validate_username before filesystem access
+        assert!(validate_username("../../../etc/passwd").is_err());
+        assert!(validate_username("..").is_err());
+        assert!(validate_username("foo/bar").is_err());
+
+        // For a simulated user directory with symlink pointing outside base directory
+        let unique_name = format!("sentinel_test_containment_{}", std::process::id());
+        let temp_dir = std::env::temp_dir().join(unique_name);
+        let base = temp_dir.join("users");
+        let _ = std::fs::create_dir_all(&base);
+
+        let evil_target = temp_dir.join("secret.txt");
+        let _ = std::fs::write(&evil_target, "secret");
+
+        // Create a symlink to outside target
+        #[cfg(unix)]
+        {
+            let symlink_path = base.join("symlink_test");
+            let _ = std::os::unix::fs::symlink(&evil_target, &symlink_path);
+            let canonical = std::fs::canonicalize(&symlink_path);
+            if let Ok(c) = canonical {
+                assert!(!c.starts_with(&base), "Symlink resolving outside base dir must be detected");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+}
+
+
