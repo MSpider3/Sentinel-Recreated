@@ -5,6 +5,18 @@ All notable changes to Sentinel Recreated will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-10-02
+
+### Added
+- **Display Manager & Greeter Detection Engine (`greeter_detect.rs`)**: Implemented isolated detection in the Rust daemon that inspects `/proc`, systemd display-manager services, and greeter configs (`/etc/greetd/config.toml`) with zero runtime overhead or external crate dependencies.
+- **Informational D-Bus API (`GetGreeterInfo`)**: Exposed read-only `com.sentinel.Sentinel.GetGreeterInfo` method returning serialized greeter detection metadata, Tab-key trigger status, face PAM icon capability, and active PAM service configuration.
+- **Python Greeter Diagnostics Module (`greeter_info.py`)**: Added native Python detection mirroring the Rust detection logic, enabling offline diagnosis without requiring the D-Bus daemon to be running.
+- **Greeter Inspection CLI Subcommand (`sentinel greeter-info`)**: Added `sentinel greeter-info` (with `--json` support) to check active greeter, PAM configuration status (`pam_sentinel.so`), and recommended authentication interaction mode.
+- **Greeter Integration Documentation (`GREETER_INTEGRATION.md`)**: Comprehensive architectural guide covering native Dank Greeter Tab-key & icon integration (upstream PR #21), GDM/GNOME Shell interaction constraints, SDDM, Hyprlock/Swaylock setups, and the universal fail-safe PAM conversation model.
+
+### Integration
+- **Upstream Dank Greeter (`dms-greeter`) Native Support**: Upstream Dank Greeter has officially merged native secondary authentication on `Tab` and generalized face PAM detection ([PR #21](https://github.com/AvengeMedia/dank-greeter/pull/21), commit `334b2c93d444b65e4fad5b16f3409bcdc013e40f`). Pressing `Tab` on an empty password prompt in `dms-greeter` triggers face authentication natively with dynamic face recognition tooltip and icon, requiring zero custom forks.
+
 ## [0.1.2] - 2026-09-23
 
 ### Security & Hardening

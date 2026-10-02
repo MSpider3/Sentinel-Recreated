@@ -13,6 +13,9 @@ use crate::pipeline::{
     SentinelAuthenticator, SpoofDetector,
 };
 
+#[path = "../greeter_detect.rs"]
+pub mod greeter_detect;
+
 pub struct EnrollmentSession {
     pub session_id: String,
     pub owner: String,
@@ -857,6 +860,12 @@ impl SentinelService {
         Ok(status_json.to_string())
     }
 
+    async fn get_greeter_info(&self) -> zbus::fdo::Result<String> {
+        let info = greeter_detect::detect();
+        serde_json::to_string(&info)
+            .map_err(|e| zbus::fdo::Error::Failed(format!("Failed to serialize greeter info: {}", e)))
+    }
+
     async fn get_intrusion_list(
         &self,
         #[zbus(header)] header: zbus::MessageHeader<'_>,
@@ -1138,6 +1147,18 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_get_greeter_info_serializable() {
+        let info = greeter_detect::detect();
+        let serialized = serde_json::to_string(&info);
+        assert!(serialized.is_ok());
+        let val: serde_json::Value = serde_json::from_str(&serialized.unwrap()).unwrap();
+        assert!(val.get("greeter_type").is_some());
+        assert!(val.get("has_tab_trigger").is_some());
+        assert!(val.get("has_face_pam_icon").is_some());
+        assert!(val.get("pam_service").is_some());
     }
 }
 

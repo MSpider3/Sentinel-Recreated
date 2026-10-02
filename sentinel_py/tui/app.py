@@ -102,17 +102,20 @@ class DashboardScreen(Screen):
         table = self.query_one("#log_table", DataTable)
         table.clear()
         has_entries = False
-        try:
-            lines = self.app.dbus_client.get_recent_auth_log(10)
-            for line in lines:
-                parts = line.split("|")
-                if len(parts) >= 8:
-                    ts, usr, res, dist, tier, live, spoof, ms = parts[:8]
-                    c = "green" if res == "GRANTED" else ("red" if res == "DENIED" else "yellow")
-                    table.add_row(ts, usr, f"[{c}]{res}[/{c}]", dist, tier, live, spoof, ms)
-                    has_entries = True
-        except Exception:
-            pass
+        if not getattr(self, "log_auth_disabled", False):
+            try:
+                lines = self.app.dbus_client.get_recent_auth_log(10)
+                for line in lines:
+                    parts = line.split("|")
+                    if len(parts) >= 8:
+                        ts, usr, res, dist, tier, live, spoof, ms = parts[:8]
+                        c = "green" if res == "GRANTED" else ("red" if res == "DENIED" else "yellow")
+                        table.add_row(ts, usr, f"[{c}]{res}[/{c}]", dist, tier, live, spoof, ms)
+                        has_entries = True
+            except Exception as e:
+                # If unauthorized or cancelled, avoid polling again in a loop
+                if any(err in str(e) for err in ("NotSupported", "AccessDenied", "Failed")):
+                    self.log_auth_disabled = True
         if not has_entries:
             table.add_row("-", "-", "[dim]No auth events today[/dim]", "-", "-", "-", "-", "-")
 

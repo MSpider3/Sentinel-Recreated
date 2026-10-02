@@ -28,24 +28,24 @@
 
 ## 3. Tab-key face auth / Enter-key password separation (login & lock screens)
 
-Status: Researched, verified not natively possible across GDM, DMS greeter, or desktop shells without custom forking.
+Status: **Officially Merged Upstream in Dank Greeter (`dms-greeter`)** via [PR #21](https://github.com/AvengeMedia/dank-greeter/pull/21) (Commit `334b2c93d444b65e4fad5b16f3409bcdc013e40f`). Natively supported without custom forks in upcoming Dank Greeter releases. Remains unsupported in GDM due to upstream GNOME Shell architectural constraints.
 
-Investigated the installed Dank Material Shell (DMS 1.6.1), `dms-greeter` (1.6.2), and **GDM 50 / GNOME Shell 50**
+Investigated the installed Dank Material Shell (DMS 1.6.1), `dms-greeter` (1.6.2+), and **GDM 50 / GNOME Shell 50**
 to determine whether tab-key triggering or external factor separation is supported.
 
 Detailed Findings:
 
-1. **GDM / GNOME Shell Architecture (`gdm-password`, `gnome-shell`)**:
+1. **DMS Greeter Architecture (`dms-greeter` / `greetd`) — RESOLVED UPSTREAM**:
+   - **Upstream Contribution Merged**: Merged into `AvengeMedia/dank-greeter` master via [PR #21](https://github.com/AvengeMedia/dank-greeter/pull/21).
+   - **Native Tab Key Interception**: In `GreeterContent.qml`, pressing `Tab` on an empty password field explicitly triggers `root.startAuthSession(false)` to start secondary/external authentication. Standard tab/backtab focus navigation is preserved when text is entered, when a password prompt is pending, or in username entry mode.
+   - **Standardized Face PAM Modality**: Introduced `greeterPamHasFaceAuth` to natively recognize `pam_sentinel`, `pam_howdy`, and `pam_face` modules from `/etc/pam.d/greetd`, displaying the `"face"` icon and `"Face recognition"` tooltip.
+   - **Zero Forking Required**: Any system running standard upstream `dms-greeter` with Sentinel configured in `/etc/pam.d/greetd` now supports Tab-triggered face authentication out of the box.
+
+2. **GDM / GNOME Shell Architecture (`gdm-password`, `gnome-shell`) — UNSUPPORTED UPSTREAM**:
    - **Hardcoded PAM Services**: In GNOME Shell's GDM utility (`/org/gnome/shell/gdm/util.js`), authentication services are strictly hardcoded to `gdm-password`, `gdm-fingerprint`, and `gdm-smartcard`. There is no configuration key or D-Bus API to register a third-party auth service.
    - **Parallel Biometrics Architecture**: GDM runs `gdm-password` in the foreground and can run `gdm-fingerprint` simultaneously in the background if enrolled hardware is detected over D-Bus (`net.reactivated.Fprint`). It does not use keybindings to trigger biometrics; it polls the sensor continuously while the password entry is active.
    - **Keypress Routing**: In `authPrompt.js` and `unlockDialog.js`, keypresses on the password entry (`St.PasswordEntry`) are handled by Clutter/St. `Enter` triggers `_activateNext()`, while `Tab` is hardwired to Clutter's widget focus navigation (`TAB_FORWARD`) to cycle focus to UI buttons (Cancel, Switch User, Power). There is no hook to bind `Tab` to an auth action.
    - **Extension Isolation**: Extensions are strictly disabled in GDM display manager mode (`--mode=gdm`) for security. Even on the user lock screen (`unlockDialog.js`), extensions cannot safely intercept PAM queries without monkey-patching GNOME Shell's internal JavaScript engine.
-
-2. **DMS Greeter Architecture (`dms-greeter` / `greetd`)**:
-   - **Embedded Binary UI**: `dms-greeter` is a compiled Go binary (`/usr/bin/dms-greeter`). At launch, its QML UI is unpacked read-only into `/var/cache/dms-greeter/.cache/dms-greeter-shell/<hash>/` and checksum-verified on every launch. Modifying the unpacked QML has no effect; overriding requires passing `--shell-dir <dir>` or compiling from source (`dms-greeter sync --local`).
-   - **Hardcoded External Auth**: In `GreeterContent.qml` (lines 71–76), external auth is explicitly hardcoded to `pam_fprintd` and `pam_u2f` (`greeterPamStackHasModule("pam_fprintd")` / `"pam_u2f"`). There is no generic secondary factor registration or third-party auth hook.
-   - **No Key Interception**: In `GreeterContent.qml`, the password field is a raw QtQuick `TextInput` with no `Keys.onPressed` handlers. Pressing `Tab` simply advances GUI focus rather than triggering authentication.
-   - **Single Greetd Session IPC**: `Quickshell.Services.Greetd` communicates over `/var/run/greetd.sock` with a single PAM conversation session at a time, running `/etc/pam.d/greetd` sequentially.
 
 3. **DMS Desktop Lock Screen (`dankshell` / `Quickshell.Services.Pam`)**:
    - **Dual PAM Architecture**: Unlike the greeter, the DMS Lock Screen implements independent `PamContext` objects: `pam.passwd` (runs `/etc/pam.d/dankshell` on Enter) and `pam.u2f` (runs a custom PAM service on shortcut).
@@ -58,8 +58,8 @@ Detailed Findings:
      - If the user types a password, Sentinel preserves it in `PAM_AUTHTOK` and returns `PAM_IGNORE` immediately without camera activation or timeout latency.
      - If the user presses Enter without typing a password, Sentinel proceeds with face scanning.
      - If the camera fails or times out, it silently steps aside to standard password verification.
-   - This approach is universal and works seamlessly across GDM, DMS Greeter, SDDM, LightDM, Swaylock, and Hyprlock without requiring display manager forks or shell modifications.
+   - This approach is universal and works seamlessly across GDM, SDDM, LightDM, Swaylock, and Hyprlock without requiring display manager forks or shell modifications.
 
-Decision: Not pursuing separate Tab/Enter keybinding. It is impossible in both GDM and `dms-greeter` without maintaining fragile forks, and Sentinel's PAM conversation architecture in `pam_sentinel.c` already provides a clean, race-free, universal experience.
-
-Revisit if: Upstream display managers (GDM, greetd) standardize an external biometric provider or custom keybinding API.
+Current Status:
+- **Dank Greeter (`dms-greeter`)**: Fully supported natively via upstream merge ([PR #21](https://github.com/AvengeMedia/dank-greeter/pull/21)).
+- **GDM / Other Display Managers**: Universal PAM conversation architecture in `pam_sentinel.c` provides a clean, race-free experience without requiring custom forks.

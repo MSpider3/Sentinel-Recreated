@@ -175,10 +175,55 @@ def cmd_calibrate_spoof(client: SentinelDBusClient, args):
         print("\nWARNING: MiniFASNet may not reliably distinguish live faces from photos on this camera.")
         print("The system will rely primarily on distance thresholding for spoof protection.")
 
+def cmd_greeter_info(client: SentinelDBusClient, args):
+    info = None
+    if client is not None:
+        try:
+            raw_json = client.iface.GetGreeterInfo()
+            info = json.loads(str(raw_json))
+        except Exception:
+            pass
+
+    if not info:
+        from sentinel_py.greeter_info import detect_greeter
+        info = detect_greeter()
+
+    if getattr(args, "json", False):
+        print(json.dumps(info, indent=2))
+        return
+
+    greeter_name = info.get("greeter_name", "Unknown")
+    pam_service_path = info.get("pam_service_path", "/etc/pam.d/greetd")
+    sentinel_pam_configured = info.get("sentinel_pam_configured", False)
+    has_tab_trigger = info.get("has_tab_trigger", False)
+    has_face_pam_icon = info.get("has_face_pam_icon", False)
+    setup_hint = info.get("setup_hint", "")
+
+    pam_status_str = "✓ pam_sentinel.so configured" if sentinel_pam_configured else f"✗ Not configured in {pam_service_path}"
+    tab_status_str = "✓ Supported (upstream PR #21)" if has_tab_trigger else "✗ Not supported"
+    icon_status_str = "✓ Displayed in greeter" if has_face_pam_icon else "✗ Not supported"
+
+    print("Greeter Detection")
+    print("─────────────────")
+    print(f"  Active Greeter:     {greeter_name}")
+    print(f"  PAM Service:        {pam_service_path}")
+    print(f"  Sentinel in PAM:    {pam_status_str}")
+    print(f"  Tab-key Trigger:    {tab_status_str}")
+    print(f"  Face Auth Icon:     {icon_status_str}")
+    print()
+    if setup_hint:
+        print(f"  Status: {setup_hint}")
+
 def main():
+    from sentinel_py import __version__
     parser = argparse.ArgumentParser(
         prog="sentinel",
         description="Sentinel Recreated — Biometric Face Authentication CLI & Enrollment Tool"
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -220,8 +265,16 @@ def main():
     p_calib.add_argument("username", nargs="?", default=None, help="Username to test (default: current user)")
     p_calib.set_defaults(func=cmd_calibrate_spoof)
 
+    # greeter-info
+    p_greeter = subparsers.add_parser("greeter-info", help="Inspect display manager and greeter integration status")
+    p_greeter.add_argument("--json", action="store_true", help="Output raw JSON")
+    p_greeter.set_defaults(func=cmd_greeter_info)
+
     args = parser.parse_args()
-    client = SentinelDBusClient()
+    try:
+        client = SentinelDBusClient()
+    except Exception:
+        client = None
     args.func(client, args)
 
 if __name__ == "__main__":
