@@ -21,30 +21,16 @@ The PAM module (`pam_sentinel.so`) acts strictly as a lightweight bridge connect
 | Daemon DBus Result | PAM Return Code | System Auth Behavior |
 |---|---|---|
 | `GRANTED` | `PAM_SUCCESS` | Authentication successful; bypass password prompt if configured as `sufficient`. |
-| `REQUIRE_2FA` | `PAM_AUTH_ERR` | Biometric valid, but 2FA policy enforced; PAM shows failure notice then falls through to password prompt (second factor). |
-| `DENIED` | `PAM_AUTH_ERR` | Face distance exceeds all thresholds; PAM shows failure notice then falls through to password prompt. |
-| `TIMEOUT` | `PAM_AUTH_ERR` | Active liveness session timed out (120 s global, or 20 s challenge). See note below. |
-| `SPOOF` | `PAM_AUTH_ERR` | Anti-spoofing score violated live threshold; PAM shows failure notice then falls through to password prompt. |
-| `NO_FACE` | `PAM_IGNORE` | No face present in field of view; transparently fall back to password with **no** failure notice. See note below. |
-| **Daemon Offline / DBus Error** | **`PAM_IGNORE`** | **Fail-safe fallback: transparently hand off control to standard unix password module.** |
+| `DENIED`, `SPOOF`, `TIMEOUT`, `NO_FACE`, `RATE_LIMITED`, anything else | `PAM_IGNORE` | Step aside; the next module (`pam_unix.so`) asks for the password. |
+| **Daemon Offline / DBus Error / no reply in 8 s** | **`PAM_IGNORE`** | **Fail-safe fallback: transparently hand off control to standard unix password module.** |
 
 > [!NOTE]
-> **`PAM_IGNORE` vs `PAM_AUTH_ERR` — semantic distinction**
+> **Why everything except `GRANTED` is `PAM_IGNORE`**
 >
-> - **`PAM_IGNORE`** means *"I have no opinion — try the next module."*  PAM falls through to `pam_unix.so` silently with no failure message. Use this when the camera never meaningfully engaged (daemon offline, no face detected at all, SSH session).
-> - **`PAM_AUTH_ERR`** means *"I tried and it failed."*  PAM shows an "authentication failed" notice in the lock screen before falling through to the password prompt. Use this when a camera session was opened and a face was involved (recognition failure, spoof, timeout).
->
-> **Rule of thumb:** if the daemon opened the camera and actively attempted recognition, use `PAM_AUTH_ERR`. If the camera never meaningfully engaged, use `PAM_IGNORE`.
+> `PAM_AUTH_ERR` would be recorded by `pam_faillock` as a failed login, so a few bad face scans could lock the account for password logins too. `PAM_IGNORE` means *"I have no opinion — try the next module"*: a failed face scan can never lock a user out.
 
 > [!NOTE]
-> **Why `TIMEOUT → PAM_AUTH_ERR` (not `PAM_IGNORE`)**
->
-> `TIMEOUT` means the camera was open and a liveness session ran, but the user did not complete the challenge within the time limit. This is an *active* failure, not a silent non-event. Returning `PAM_AUTH_ERR` causes the lock screen to show a clear failure notice before the password prompt appears, so the user understands that face auth was attempted and expired. A silent `PAM_IGNORE` would look indistinguishable from the daemon being offline.
-
-> [!NOTE]
-> **Why `NO_FACE → PAM_IGNORE` (not `PAM_AUTH_ERR`)**
->
-> `NO_FACE` means the daemon opened the camera but found no face in the field of view — the user may have walked away, covered the camera, or is outside the frame. No recognition was ever attempted, so this is not a security failure. Returning `PAM_IGNORE` gives a silent fallback to password with no failure message, which is the correct UX for "user not present".
+> **Timeouts**: the daemon ends a scan after at most 7 s (`global_session_timeout`). The module waits 8 s for the reply, so the daemon always answers first and never keeps the camera on for a caller that has already given up.
 
 ---
 
@@ -61,13 +47,13 @@ PAM Entry (pam_sm_authenticate)
        ├──► Daemon Offline/Unreachable ──► RETURN PAM_IGNORE (Fallback to Password)
        │
        ▼
-3. Call com.sentinel.Sentinel.Authenticate(username) via DBus (Timeout: 10s)
+3. Call com.sentinel.Sentinel.Authenticate(username, session_env) via DBus (Timeout: 8s)
        │
        ├──► DBus RPC Timeout/Failure  ──► RETURN PAM_IGNORE
        │
        ▼
 4. Map result string to standard PAM return code
-       └──► RETURN PAM_SUCCESS / PAM_AUTH_ERR / PAM_IGNORE
+       └──► RETURN PAM_SUCCESS ("GRANTED") / PAM_IGNORE (everything else)
 ```
 
 ---

@@ -2,12 +2,13 @@ use anyhow::{Context, Result};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use crate::config::SentinelConfig;
+use crate::config::{SecurityConfig, SentinelConfig};
 use crate::gallery::store::GalleryStore;
-use crate::pipeline::r#match::AuthTier;
+
+/// A new template closer than this to one already stored adds nothing.
+const MIN_NOVELTY: f32 = 0.10;
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, Eq)]
 pub struct MetaJson {
@@ -50,18 +51,8 @@ impl AdaptiveGallery {
                 .with_context(|| format!("Failed to create meta dir: {}", parent.display()))?;
         }
         let json = serde_json::to_string_pretty(meta)?;
-        fs::write(p, json)
-            .with_context(|| format!("Failed to write meta JSON: {}", p.display()))?;
-
-        #[cfg(unix)]
-        {
-            if let Ok(m) = fs::metadata(p) {
-                let mut perms = m.permissions();
-                perms.set_mode(0o600);
-                fs::set_permissions(p, perms).ok();
-            }
-        }
-        Ok(())
+        crate::fsutil::write_atomic(p, json.as_bytes(), 0o600)
+            .with_context(|| format!("Failed to write meta JSON: {}", p.display()))
     }
 
     pub fn load(username: &str) -> Result<Vec<[f32; 512]>> {
@@ -74,19 +65,41 @@ impl AdaptiveGallery {
         store.save_adaptive(embeddings)
     }
 
-    pub fn should_adapt(username: &str, tier: AuthTier, config: &SentinelConfig) -> bool {
-        // (a) Tier must be Golden
-        if tier != AuthTier::Golden {
+    /// Whether a just-granted face is worth keeping as a learned template.
+    ///
+    /// * `core_distance` — distance to the nearest *enrolled* template. The
+    ///   face must strongly match what the user enrolled; a match against an
+    ///   earlier learned template does not count, so learned templates can
+    ///   never drift step by step away from the enrolled face.
+    /// * `nearest_distance` — distance to the nearest stored template of any
+    ///   kind; near-duplicates are not stored.
+    /// * `spoof_score` — must be a clean "real" score.
+    pub fn is_worth_learning(
+        core_distance: f32,
+        nearest_distance: f32,
+        spoof_score: f32,
+        security: &SecurityConfig,
+    ) -> bool {
+        core_distance < security.golden_threshold
+            && nearest_distance >= MIN_NOVELTY
+            && spoof_score >= security.spoof_threshold
+    }
+
+    pub fn should_adapt(
+        username: &str,
+        core_distance: f32,
+        nearest_distance: f32,
+        spoof_score: f32,
+        config: &SentinelConfig,
+    ) -> bool {
+        // A limit of 0 switches learning off.
+        if config.adaptive_policy.adaptation_limit_per_day == 0
+            || !Self::is_worth_learning(core_distance, nearest_distance, spoof_score, &config.security)
+        {
             return false;
         }
 
-        // (b) Lucky roll: 1 in 11 chance (rand % 11 == 7)
-        let roll: u32 = rand::random::<u32>() % 11;
-        if roll != 7 {
-            return false;
-        }
-
-        // (c) Daily rate limit check from meta.json
+        // Daily rate limit check from meta.json
         let today = Local::now().format("%Y-%m-%d").to_string();
         let meta = Self::load_meta(username);
         if meta.last_adaptation_date == today
@@ -131,6 +144,20 @@ impl AdaptiveGallery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_learning_rules() {
+        let sec = SecurityConfig::default(); // golden 0.28, clean spoof 0.80
+        // Strong match to an enrolled template, a bit different, clearly live.
+        assert!(AdaptiveGallery::is_worth_learning(0.18, 0.15, 0.95, &sec));
+        // Only matches an earlier learned template, not the enrolled face.
+        assert!(!AdaptiveGallery::is_worth_learning(0.35, 0.15, 0.95, &sec));
+        // Near-duplicate of something already stored.
+        assert!(!AdaptiveGallery::is_worth_learning(0.18, 0.03, 0.95, &sec));
+        // Anti-spoof score not clean.
+        assert!(!AdaptiveGallery::is_worth_learning(0.18, 0.15, 0.60, &sec));
+        assert!(!AdaptiveGallery::is_worth_learning(0.18, 0.15, f32::NAN, &sec));
+    }
 
     #[test]
     fn test_meta_json_serialization() {

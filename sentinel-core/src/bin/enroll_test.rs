@@ -210,7 +210,7 @@ fn main() -> Result<()> {
                         );
 
                         if let Ok(aligned) = align_face(frame, &det.landmarks) {
-                            if let Ok(emb) = embedder.embed(&aligned) {
+                            if let Ok(emb) = embedder.embed_with_flip(&aligned) {
                                 pose_samples.push(emb);
                                 thread::sleep(Duration::from_millis(300));
                             }
@@ -282,6 +282,7 @@ fn main() -> Result<()> {
     println!("\nSaving embeddings to gallery...");
     let store = GalleryStore::new(&args.user);
     store.save_core(&collected_embeddings)?;
+    store.clear_adaptive()?;
 
     println!(
         "\nSUCCESS: Enrolled {} vectors for user '{}'",

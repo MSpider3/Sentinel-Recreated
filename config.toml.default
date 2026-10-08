@@ -6,25 +6,24 @@ fps = 30
 
 [detection]
 scrfd_input_size = 320
-min_face_size_px = 40
+min_face_size_px = 80
 score_threshold = 0.50
 nms_threshold = 0.30
 
 [security]
-golden_threshold = 0.28
-standard_threshold = 0.42
-two_factor_threshold = 0.50
-recognition_threshold = 0.38
-spoof_threshold = 0.70
-spoof_threshold_golden = 0.70
-spoof_threshold_standard = 0.55
-max_retries = 3
-challenge_timeout_secs = 20.0
-global_session_timeout = 25.0
-gallery_max_size = 20
-require_liveness = false
+# Face match distance (0 = identical). Smaller is stricter.
+golden_threshold = 0.28        # strong match: one clean frame is enough
+standard_threshold = 0.42      # normal match: several frames in a row needed
+two_factor_threshold = 0.50    # above this the face is a different person
+# Anti-spoof "real" score (0..1). Larger is stricter.
+spoof_threshold = 0.80           # needed for a one-frame grant
+spoof_threshold_standard = 0.70  # needed on every frame of a voted grant
+max_retries = 3                  # low anti-spoof frames allowed per scan
+global_session_timeout = 7.0     # seconds before falling back to the password (max 7)
+gallery_max_size = 20            # learned templates kept per user
 
-[storage]
-data_dir = "/var/lib/sentinel"
-models_dir = "/var/cache/sentinel/models"
-log_dir = "/var/log/sentinel"
+[adaptive_policy]
+adaptation_limit_per_day = 1
+
+[hardware]
+onnx_num_threads = 2             # physical CPU cores

@@ -7,9 +7,13 @@
 
 ## 1. Enrollment Subsystem Division & Camera Ownership
 
-The face enrollment process is an interactive wizard. Responsibility and hardware ownership are strictly partitioned:
-- **Rust Daemon (`sentinel-core`) — Camera Owner**: The daemon strictly owns the camera hardware device (`/dev/video*`). When `SubmitEnrollmentFrame(session_id)` is invoked via DBus, the daemon captures high-quality frames directly from the hardware pipeline, validates them against quality gates, executes SCRFD detection and 5-point alignment, extracts 512-d embeddings, and writes binary numpy array data (`gallery.npy`). This design (Option A) eliminates transmitting raw frame byte buffers over DBus and guarantees security by preventing client frame tampering.
-- **Python Client (`sentinel-py/enroll.py`) — Session Orchestrator**: Renders the UI preview window, overlays status messages, guides the user through pose prompt state machine transitions, and triggers DBus control calls (`StartEnrollment`, `SubmitEnrollmentFrame`, `FinishEnrollment`).
+The face enrollment process is an interactive wizard:
+- **Python Client (`sentinel_py/enroll.py`) — Camera Owner & UI**: opens the camera named in the daemon's config (`camera.source`), shows the live preview, guides the user through the poses and sends frames to the daemon with `SubmitEnrollmentFrameData`.
+- **Rust Daemon (`sentinel-core`) — Judge & Store**: checks each frame and, only when asked to capture, turns it into a template. It never opens the camera during enrollment.
+
+Two kinds of frame submission:
+- **Preview** (`capture = false`, about 10 per second): the daemon reports whether the frame *would* be accepted. Nothing is stored.
+- **Capture** (`capture = true`, when the user presses SPACE): an accepted frame becomes one template.
 
 ---
 
@@ -23,7 +27,7 @@ The face enrollment process is an interactive wizard. Responsibility and hardwar
 5. **Down**: Pitch head tilt approximately $10^\circ$ downwards. (3 sub-samples)
 
 ### Glasses Wearer Variant (30 Embeddings)
-If the user indicates they wear glasses during enrollment setup:
+`sentinel enroll` asks *"Do you wear glasses, even only sometimes?"* before the camera opens (`--glasses` / `--no-glasses` answer it in advance). If the answer is yes:
 1. Complete Base 5-Pose Sequence **WITH glasses** $\rightarrow 15\text{ embeddings}$.
 2. Interactive Pause Prompt: *"Please remove your glasses and press ENTER."*
 3. Complete Base 5-Pose Sequence **WITHOUT glasses** $\rightarrow 15\text{ embeddings}$.
@@ -31,14 +35,19 @@ If the user indicates they wear glasses during enrollment setup:
 
 ---
 
-## 3. Daemon Camera Sampling & Quality Gates (Enrollment Frame Validation)
+## 3. Frame Validation
 
-When `SubmitEnrollmentFrame(session_id)` is invoked via DBus, the daemon directly samples the current camera frame and evaluates:
-1. **Detection Gate**: Face MUST be detected by SCRFD with confidence $\ge 0.60$.
-2. **Dimension Gate**: Face bounding box height and width MUST be $\ge 25\%$ of the shorter frame dimension ($120\text{ px}$ for $640\times 480$).
-3. **Single Identity Gate**: Frame MUST contain **exactly one face**. Multi-face frames return `MULTIPLE_FACES`.
-4. **Landmark Stability Gate**: 5 facial landmarks must be extracted and successfully fit the affine transformation matrix without mathematical singularity.
-5. *Note: Anti-spoofing and active liveness checks are disabled during enrollment, as physical user session initiation is verified by PolicyKit administrative password escalation.*
+Each submitted frame must pass, in order:
+1. **Single Identity Gate**: exactly one face (`MULTIPLE_FACES` / `NO_FACE` otherwise), at least `min_face_size_px` wide and tall.
+2. **Quality Gate** — the same one authentication uses: landmarks inside the frame (`OUT_OF_FRAME`), roughly frontal (`NOT_FRONTAL`), not too dark or bright (`TOO_DARK` / `TOO_BRIGHT`), not blurred (`BLURRY`). The pose prompts therefore mean a *slight* turn; a strong turn is refused.
+3. **On capture only**:
+   - the template is the sum of the embeddings of the face and its mirror image, normalised;
+   - a capture within cosine distance 0.01 of one already collected is the same picture again (`TOO_SIMILAR`);
+   - at most 40 templates per enrollment (`FULL`); at least 15 are needed to finish.
+
+`FinishEnrollment` writes `gallery.npy` and **deletes the user's learned templates** (`adaptive.npy`, `meta.json`): a new enrollment replaces the identity.
+
+*Anti-spoofing is not run during enrollment; starting an enrollment requires PolicyKit administrator authentication.*
 
 ---
 
@@ -75,8 +84,8 @@ When `SubmitEnrollmentFrame(session_id)` is invoked via DBus, the daemon directl
 To adapt seamlessly to gradual biological changes (aging, facial hair, lighting variations), the daemon maintains an adaptive FIFO gallery (`adaptive.npy`).
 
 ### Update Eligibility Criteria:
-1. **Tier 1 (Golden Zone) Only**: Cosine distance $d < 0.25$.
-2. **Probabilistic Roll ($p \approx 0.09$)**: 1 in 11 Tier 1 authentication sessions triggers adaptive save. Prevents rapid overfitting.
-3. **Daily Rate Limit**: Maximum **1 adaptation vector saved per calendar day** per user.
-4. **Capacity Cap**: Maximum 20 vectors ($20 \times 512$). FIFO eviction drops the oldest adaptive vector when capacity is reached.
-5. **Clean Vector Generation**: The adaptive embedding is computed from a fresh aligned crop of the current authentication frame rather than reusing temporary pipeline arrays.
+1. **Strong match to an enrolled template**: distance to the nearest *enrolled* template $<$ `golden_threshold`, on a frame that was granted on its own. Matching only an earlier learned template is not enough, so learned templates cannot drift away from the enrolled face step by step.
+2. **Clean anti-spoof score**: at least `spoof_threshold`.
+3. **Something new**: at least 0.10 away from every stored template (near-duplicates are not kept).
+4. **Daily Rate Limit**: Maximum **1 adaptation vector saved per calendar day** per user (`adaptation_limit_per_day`).
+5. **Capacity Cap**: at most `gallery_max_size` (20) vectors. FIFO eviction drops the oldest learned vector. Enrolled templates are never evicted or changed.

@@ -1,20 +1,22 @@
 use anyhow::{bail, Context, Result};
-use image::RgbImage;
-use ort::execution_providers::{CPUExecutionProvider, OpenVINOExecutionProvider};
+use image::{imageops, RgbImage};
 use ort::{session::Session, value::Tensor};
 
-pub fn l2_normalize(v: &mut [f32; 512]) {
+/// Scale `v` to unit length. Returns false (leaving `v` untouched) when the
+/// vector has no usable direction (near-zero or non-finite norm).
+pub fn l2_normalize(v: &mut [f32; 512]) -> bool {
     let mut sum_sq = 0.0f64;
     for x in v.iter() {
         sum_sq += (*x as f64) * (*x as f64);
     }
     let norm = sum_sq.sqrt() as f32;
-    if norm < 1e-10 {
-        panic!("Degenerate embedding vector: L2 norm is near zero");
+    if !norm.is_finite() || norm < 1e-10 {
+        return false;
     }
     for x in v.iter_mut() {
         *x /= norm;
     }
+    true
 }
 
 pub struct MobileFaceNet {
@@ -25,19 +27,13 @@ impl MobileFaceNet {
     pub fn new(model_path: &str) -> Result<Self> {
         let session = Session::builder()
             .map_err(|e| anyhow::anyhow!("{:?}", e))?
-            .with_execution_providers([
-                OpenVINOExecutionProvider::default().build(),
-                CPUExecutionProvider::default().build(),
-            ])
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?
-            .with_intra_threads(2)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?
             .commit_from_file(model_path)
             .with_context(|| format!("Failed to load MobileFaceNet ONNX model from: {}", model_path))?;
         Ok(Self { session })
     }
 
-    pub fn embed(&mut self, aligned_face: &RgbImage) -> Result<[f32; 512]> {
+    /// Raw (not normalised) 512-d network output for one aligned face.
+    fn forward(&mut self, aligned_face: &RgbImage) -> Result<[f32; 512]> {
         if aligned_face.width() != 112 || aligned_face.height() != 112 {
             bail!(
                 "Invalid input size for MobileFaceNet: expected 112x112, got {}x{}",
@@ -71,8 +67,28 @@ impl MobileFaceNet {
 
         let mut vec = [0.0f32; 512];
         vec.copy_from_slice(slice);
-        l2_normalize(&mut vec);
+        Ok(vec)
+    }
 
+    pub fn embed(&mut self, aligned_face: &RgbImage) -> Result<[f32; 512]> {
+        let mut vec = self.forward(aligned_face)?;
+        if !l2_normalize(&mut vec) {
+            bail!("Degenerate embedding vector: L2 norm is near zero");
+        }
+        Ok(vec)
+    }
+
+    /// Embedding of the face plus its mirror image, summed then normalised.
+    /// Twice the cost of `embed`; used at enrollment to get steadier templates.
+    pub fn embed_with_flip(&mut self, aligned_face: &RgbImage) -> Result<[f32; 512]> {
+        let mut vec = self.forward(aligned_face)?;
+        let mirrored = self.forward(&imageops::flip_horizontal(aligned_face))?;
+        for (a, b) in vec.iter_mut().zip(mirrored.iter()) {
+            *a += b;
+        }
+        if !l2_normalize(&mut vec) {
+            bail!("Degenerate embedding vector: L2 norm is near zero");
+        }
         Ok(vec)
     }
 }
@@ -84,12 +100,18 @@ mod tests {
     #[test]
     fn test_embedding_unit_norm() {
         let mut raw = [0.5f32; 512];
-        l2_normalize(&mut raw);
+        assert!(l2_normalize(&mut raw));
         let mut norm_sq = 0.0f32;
         for x in raw {
             norm_sq += x * x;
         }
         let norm = norm_sq.sqrt();
         assert!((norm - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_degenerate_embedding_is_rejected_not_a_panic() {
+        assert!(!l2_normalize(&mut [0.0f32; 512]));
+        assert!(!l2_normalize(&mut [f32::NAN; 512]));
     }
 }

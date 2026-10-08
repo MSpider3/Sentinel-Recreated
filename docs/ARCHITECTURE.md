@@ -39,9 +39,12 @@ sentinel_recreated/
 │   │   │   ├── align.rs            # 5-point affine transformation matrix (112×112)
 │   │   │   ├── embed.rs            # MobileFaceNet / ArcFace ONNX inference
 │   │   │   ├── match.rs            # Cosine distance computation & tier decision engine
-│   │   │   ├── spoof.rs            # MiniFASNetV2 anti-spoofing checker
-│   │   │   └── liveness.rs         # MediaPipe EAR blink & head-pose state machine
-│   │   ├── gallery/                # Embedding store, adaptive FIFO gallery & blacklist
+│   │   │   ├── spoof.rs            # MiniFASNet anti-spoofing (V2 + optional V1SE)
+│   │   │   ├── quality.rs          # Frame quality gate (pose, exposure, sharpness)
+│   │   │   ├── decision.rs         # Grant / deny rules (multi-frame voting)
+│   │   │   ├── authenticator.rs    # One authentication session, frame by frame
+│   │   │   └── models.rs           # Loads all models once; shared ONNX Runtime pool
+│   │   ├── gallery/                # Embedding store, adaptive gallery & intrusion photo log
 │   │   │   ├── mod.rs
 │   │   │   ├── store.rs
 │   │   │   └── adaptive.rs
@@ -115,12 +118,12 @@ sentinel_recreated/
 │  3. Affine Warp    ──► Transform 5 landmarks to 112×112 canonical template  │
 │  4. MobileFaceNet  ──► Extract 512-dimensional normalized embedding          │
 │  5. Gallery Match  ──► Min cosine distance calculation against gallery      │
-│  6. Anti-Spoof     ──► MiniFASNet score validation                           │
+│  6. Anti-Spoof     ──► MiniFASNet score, same frame as the match            │
 │  7. Tier Decision  ──► Determine Tier 1/2/3/4                               │
-│  8. Liveness Check ──► Blink EAR state machine (if Tier 2/3)                 │
+│  8. Decision       ──► 1 clean Golden frame, or 3 matching frames in a row │
 └──────────────────────────┬──────────────────────────────────────────────────┘
                            │
-                           │ Returns: "GRANTED" | "DENIED" | "REQUIRE_2FA" | "TIMEOUT" | "NO_FACE"
+                           │ Returns: "GRANTED" | "DENIED" | "SPOOF" | "TIMEOUT" | "NO_FACE" | "RATE_LIMITED"
                            ▼
                ┌─────────────────────────┐
                │   pam_sentinel.so (C)   │

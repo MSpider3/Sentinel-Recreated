@@ -1,6 +1,6 @@
-/// auth-test binary — uses SentinelAuthenticator state machine.
-/// Mirrors authenticate.py exactly:
-///   Waiting -> Recognized -> Success/Failure/Require2FA
+/// auth-test binary — runs the same SentinelAuthenticator the daemon uses,
+/// without DBus or PAM:
+///   Waiting -> Success / Failure / Spoof / NoFace / Timeout
 ///
 /// Usage:
 ///   sudo cargo run --bin auth-test -- --user testuser [--preview] [--save-debug-frames]
@@ -10,9 +10,8 @@ use clap::Parser;
 use sentinel_core::config::SentinelConfig;
 use sentinel_core::gallery::GalleryStore;
 use sentinel_core::pipeline::{
-    ActiveTier, AuthState, DebugPreviewWindow, FrameCapture, MobileFaceNet, ScrfdDetector,
-    SentinelAuthenticator, SpoofDetector, COLOR_CALIB, COLOR_TIER1, COLOR_TIER2, COLOR_TIER3,
-    COLOR_TIER4,
+    AuthState, AuthTier, DebugPreviewWindow, FrameCapture, Models, SentinelAuthenticator,
+    COLOR_CALIB, COLOR_TIER1, COLOR_TIER2, COLOR_TIER3, COLOR_TIER4,
 };
 use std::path::PathBuf;
 use std::thread;
@@ -38,10 +37,6 @@ struct Args {
     #[arg(short, long, default_value = "/var/cache/sentinel/models")]
     models_dir: String,
 
-    /// Path for MiniFASNet calibration JSON.
-    #[arg(long, default_value = "/var/lib/sentinel/minifas_calib.json")]
-    calib_path: String,
-
     /// Camera device index (0 = first webcam).
     #[arg(short, long, default_value_t = 0)]
     device: u32,
@@ -64,62 +59,42 @@ fn main() -> Result<()> {
 
     // ── Load gallery ─────────────────────────────────────────────────────────
     let store = GalleryStore::new(&args.user);
-    let gallery = store.all_vectors()?;
+    let core_gallery = store.load_core()?;
+    let adaptive_gallery = store.load_adaptive().unwrap_or_default();
 
-    if gallery.is_empty() {
+    if core_gallery.is_empty() {
         eprintln!(
             "Error: No enrollment vectors for '{}'. Run enroll-test first.",
             args.user
         );
         std::process::exit(1);
     }
-    println!("Loaded {} gallery vectors for '{}'.", gallery.len(), args.user);
+    println!(
+        "Loaded {} enrolled + {} learned vectors for '{}'.",
+        core_gallery.len(),
+        adaptive_gallery.len(),
+        args.user
+    );
 
     // ── Load config ──────────────────────────────────────────────────────────
-    let config = SentinelConfig::load(&args.config).unwrap_or_default();
-    let models = PathBuf::from(&args.models_dir);
+    let config = SentinelConfig::load(&args.config).unwrap_or_else(|e| {
+        eprintln!("Warning: {:#} — using defaults.", e);
+        SentinelConfig::default()
+    });
 
-    let scrfd_path = models.join("scrfd_500m_kps.onnx");
-    let mfn_path   = models.join("mobile_facenet.onnx");
-    let minifas    = models.join("MiniFASNetV2.onnx");
-
-    if !scrfd_path.exists() || !mfn_path.exists() {
-        eprintln!(
-            "Error: Model files missing in {}. Run scripts/download_models.sh first.",
-            models.display()
-        );
+    // ── Load models ──────────────────────────────────────────────────────────
+    let mut models = Models::load(&PathBuf::from(&args.models_dir), &config.detection)?;
+    if models.spoof.is_none() {
+        eprintln!("Error: anti-spoof model missing — authentication cannot grant access.");
         std::process::exit(1);
     }
 
-    // ── Create models ────────────────────────────────────────────────────────
-    let detector = ScrfdDetector::new(
-        scrfd_path.to_str().unwrap(),
-        config.detection.score_threshold,
-        config.detection.nms_threshold,
-        config.detection.min_face_size_px,
-    )?;
-
-    let embedder = MobileFaceNet::new(mfn_path.to_str().unwrap())?;
-
-    let spoof = if minifas.exists() {
-        println!("MiniFASNet anti-spoof loaded: {}", minifas.display());
-        Some(SpoofDetector::new(
-            minifas.to_str().unwrap(),
-            &args.calib_path,
-            config.security.spoof_threshold,
-        )?)
-    } else {
-        println!("[Notice] MiniFASNet model not found — anti-spoofing bypassed.");
-        None
-    };
-
     // ── Build authenticator ──────────────────────────────────────────────────
     let mut auth = SentinelAuthenticator::new(
-        detector,
-        embedder,
-        gallery,
+        core_gallery,
+        adaptive_gallery,
         args.user.clone(),
-        spoof,
+        config.clone(),
     );
 
     // ── Camera ───────────────────────────────────────────────────────────────
@@ -128,7 +103,8 @@ fn main() -> Result<()> {
     } else {
         config.camera.source.clone()
     };
-    let mut capture = FrameCapture::new(&source)?;
+    let mut capture =
+        FrameCapture::with_format(&source, config.camera.width, config.camera.height, config.camera.fps)?;
     capture.start()?;
 
     // ── Preview window ────────────────────────────────────────────────────────
@@ -148,6 +124,7 @@ fn main() -> Result<()> {
     }
 
     let mut frame_count = 0u64;
+    let mut last_seq = 0u64;
     let mut last_message = String::new();
 
     println!("Authentication started. Look at the camera...\n");
@@ -156,23 +133,31 @@ fn main() -> Result<()> {
     loop {
         frame_count += 1;
 
-        // Grab latest frame
-        let captured = match capture.read_captured_frame() {
+        // Wait for the next new frame (each frame is processed once)
+        if capture.failed() {
+            eprintln!("Camera error — see log output.");
+            std::process::exit(1);
+        }
+        let captured = match capture.wait_new_frame(last_seq, Duration::from_millis(100)) {
             Some(f) => f,
             None => {
-                thread::sleep(Duration::from_millis(15));
+                if auth.expire_if_overdue() {
+                    eprintln!("\n✗ TIMED OUT (camera delivered no usable frames)");
+                    capture.stop();
+                    std::process::exit(1);
+                }
                 continue;
             }
         };
+        last_seq = captured.seq;
 
         let frame = &captured.image;
 
         // Process through state machine
-        let result = match auth.process_frame(frame) {
+        let result = match auth.process_frame(&mut models, &captured) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("[Auth] process_frame error: {e}");
-                thread::sleep(Duration::from_millis(33));
+                eprintln!("[Auth] frame skipped: {e:#}");
                 continue;
             }
         };
@@ -181,15 +166,20 @@ fn main() -> Result<()> {
         if result.message != last_message {
             let prefix = match result.state {
                 AuthState::Waiting    => "[Waiting]",
-                AuthState::Recognized => "[Recognized]",
                 AuthState::Success    => "[SUCCESS]",
-                AuthState::Failure    => "[FAILURE]",
-                AuthState::Require2FA => "[2FA REQUIRED]",
+                AuthState::Failure    => "[DENIED]",
+                AuthState::Spoof      => "[SPOOF]",
                 AuthState::NoFace     => "[NO FACE]",
+                AuthState::Timeout    => "[TIMEOUT]",
             };
             println!("{} {}", prefix, result.message);
-            if let (Some(user), Some(dist)) = (&result.matched_user, result.distance) {
-                println!("  → User: {}  Distance: {:.4}", user, dist);
+            if let Some(dist) = result.distance {
+                println!(
+                    "  → Distance: {:.4}  Tier: {:?}  Spoof score: {}",
+                    dist,
+                    result.active_tier,
+                    result.spoof_score.map_or("n/a".to_string(), |s| format!("{:.3}", s))
+                );
             }
             last_message = result.message.clone();
         }
@@ -197,25 +187,14 @@ fn main() -> Result<()> {
         // ── Preview rendering ─────────────────────────────────────────────────
         if let Some(ref mut win) = preview {
             // Map state to bbox color
-            let bbox_color = if result.face_box.is_some() {
-                match result.state {
-                    AuthState::Waiting => {
-                        // During calibration show yellow, else default white/red
-                        COLOR_CALIB
-                    }
-                    AuthState::Recognized => match result.active_tier {
-                        Some(ActiveTier::Golden)    => COLOR_TIER1, // Green
-                        Some(ActiveTier::Standard)  => COLOR_TIER2, // Cyan
-                        Some(ActiveTier::TwoFactor) => COLOR_TIER3, // Orange
-                        None                        => COLOR_TIER4,
-                    },
-                    AuthState::Success    => COLOR_TIER1, // Green
-                    AuthState::Failure    => COLOR_TIER4, // Red
-                    AuthState::Require2FA => COLOR_TIER3, // Orange
-                    AuthState::NoFace     => COLOR_TIER4, // Red
-                }
-            } else {
-                COLOR_TIER4
+            let bbox_color = match (&result.state, result.active_tier) {
+                (AuthState::Success, _) => COLOR_TIER1,
+                (AuthState::Failure | AuthState::Spoof | AuthState::Timeout | AuthState::NoFace, _) => COLOR_TIER4,
+                (AuthState::Waiting, Some(AuthTier::Golden)) => COLOR_TIER1,
+                (AuthState::Waiting, Some(AuthTier::Standard)) => COLOR_TIER2,
+                (AuthState::Waiting, Some(AuthTier::TwoFactor)) => COLOR_TIER3,
+                (AuthState::Waiting, Some(AuthTier::Denied)) => COLOR_TIER4,
+                (AuthState::Waiting, None) => COLOR_CALIB,
             };
 
             let colored_bboxes: Vec<([f32; 4], u32)> = result
@@ -247,25 +226,15 @@ fn main() -> Result<()> {
                 thread::sleep(Duration::from_millis(1500));
                 break;
             }
-            AuthState::Failure => {
-                eprintln!("\n✗ ACCESS DENIED");
+            AuthState::Failure | AuthState::Spoof | AuthState::Timeout | AuthState::NoFace => {
+                eprintln!("\n✗ NOT GRANTED ({:?})", result.state);
                 eprintln!("  Reason: {}", result.message);
                 thread::sleep(Duration::from_millis(1500));
                 capture.stop();
                 std::process::exit(1);
             }
-            AuthState::Require2FA => {
-                println!("\n⚡ 2FA REQUIRED");
-                println!("  Biometrics passed but 2FA is mandatory (Tier 3 match).");
-                println!("  Exit code 2 — caller should prompt for 2nd factor.");
-                thread::sleep(Duration::from_millis(1500));
-                capture.stop();
-                std::process::exit(2);
-            }
-            _ => {}
+            AuthState::Waiting => {}
         }
-
-        thread::sleep(Duration::from_millis(33)); // ~30 fps polling
     }
 
     capture.stop();

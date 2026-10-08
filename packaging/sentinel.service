@@ -19,7 +19,9 @@ MemoryHigh=3G
 # System protection and sandbox
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/var/lib/sentinel /var/log/sentinel
+# /etc/sentinel is writable so the SetConfig DBus method can save the config.
+# The leading '-' lets the unit start even if that directory is missing.
+ReadWritePaths=/var/lib/sentinel /var/log/sentinel -/etc/sentinel
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true

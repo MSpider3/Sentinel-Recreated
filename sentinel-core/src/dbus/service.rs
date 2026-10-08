@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -8,9 +8,9 @@ use zbus::zvariant;
 
 use crate::config::SentinelConfig;
 use crate::gallery::GalleryStore;
+use crate::limiter::AttemptLimiter;
 use crate::pipeline::{
-    align_face, ActiveTier, AuthState, FrameCapture, MobileFaceNet, ScrfdDetector,
-    SentinelAuthenticator, SpoofDetector,
+    align_face, quality, AuthState, AuthTier, FrameCapture, Models, SentinelAuthenticator,
 };
 
 #[path = "../greeter_detect.rs"]
@@ -28,14 +28,27 @@ pub struct EnrollmentSession {
 
 /// Maximum lifetime of an enrollment session (interactive wizard budget).
 pub const ENROLLMENT_SESSION_TTL: Duration = Duration::from_secs(1800);
+/// Fewest templates an enrollment must collect to be saved.
+pub const MIN_ENROLL_VECTORS: usize = 15;
+/// Most templates one enrollment may hold. Every extra template is one more
+/// chance for a stranger to match, so the gallery is kept small.
+pub const MAX_ENROLL_VECTORS: usize = 40;
+/// A capture closer than this (cosine distance) to one already collected is
+/// the same picture again and is not stored.
+const DUPLICATE_DISTANCE: f32 = 0.01;
 
 pub struct SentinelService {
     pub config: Arc<Mutex<SentinelConfig>>,
     pub config_path: PathBuf,
     pub models_dir: PathBuf,
+    /// Loaded once at start-up. The lock also makes sure only one camera
+    /// scan runs at a time.
+    pub models: Arc<Mutex<Models>>,
+    pub spoof_available: bool,
     pub start_time: Instant,
     pub last_auth_result: Arc<Mutex<String>>,
     pub active_enrollment: Arc<Mutex<Option<EnrollmentSession>>>,
+    pub attempts: Arc<Mutex<AttemptLimiter>>,
     pub rt_handle: tokio::runtime::Handle,
 }
 
@@ -44,15 +57,19 @@ impl SentinelService {
         config: SentinelConfig,
         config_path: PathBuf,
         models_dir: PathBuf,
+        models: Models,
         rt_handle: tokio::runtime::Handle,
     ) -> Self {
         Self {
             config: Arc::new(Mutex::new(config)),
             config_path,
             models_dir,
+            spoof_available: models.spoof.is_some(),
+            models: Arc::new(Mutex::new(models)),
             start_time: Instant::now(),
             last_auth_result: Arc::new(Mutex::new("None".to_string())),
             active_enrollment: Arc::new(Mutex::new(None)),
+            attempts: Arc::new(Mutex::new(AttemptLimiter::default())),
             rt_handle,
         }
     }
@@ -76,6 +93,26 @@ impl SentinelService {
         let sender = header.sender().map(|s| s.to_string());
         Self::is_session_valid(session, sender.as_deref(), session_id)
     }
+
+    /// Answer an Authenticate call without using the camera. NO_FACE makes
+    /// pam_sentinel.so step aside so the password prompt takes over.
+    async fn skip_scan(
+        &self,
+        ctxt: &zbus::SignalContext<'_>,
+        reason: &str,
+    ) -> zbus::fdo::Result<(String, f64, i32)> {
+        log::info!("[DBus] Face scan skipped: {}.", reason);
+        *lock(&self.last_auth_result) = format!("NO_FACE ({})", reason);
+        let _ = Self::auth_status_changed(ctxt, "NO_FACE", reason).await;
+        Ok(("NO_FACE".to_string(), -1.0, 0))
+    }
+}
+
+/// Lock a mutex even if an earlier holder panicked. The data guarded here
+/// (models, limiter, config) stays usable after a panic, and refusing the lock
+/// forever would silently switch face authentication off.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn is_lid_closed() -> bool {
@@ -91,6 +128,47 @@ fn is_lid_closed() -> bool {
         }
     }
     false
+}
+
+/// Ask logind whether the caller runs inside a remote (e.g. SSH) session.
+///
+/// Unlike the SSH_* environment variables, which the caller supplies and can
+/// simply unset, this comes from the system. Callers that belong to no login
+/// session at all (display-manager greeters) and any lookup error count as
+/// local, so this check can only ever make the daemon stricter.
+async fn is_remote_session(conn: &zbus::Connection, sender: &str) -> bool {
+    async fn query(conn: &zbus::Connection, sender: &str) -> zbus::Result<bool> {
+        let pid: u32 = zbus::Proxy::new(
+            conn,
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+        )
+        .await?
+        .call("GetConnectionUnixProcessID", &(sender))
+        .await?;
+
+        let session_path: zvariant::OwnedObjectPath = zbus::Proxy::new(
+            conn,
+            "org.freedesktop.login1",
+            "/org/freedesktop/login1",
+            "org.freedesktop.login1.Manager",
+        )
+        .await?
+        .call("GetSessionByPID", &(pid))
+        .await?;
+
+        zbus::Proxy::new(
+            conn,
+            "org.freedesktop.login1",
+            session_path,
+            "org.freedesktop.login1.Session",
+        )
+        .await?
+        .get_property::<bool>("Remote")
+        .await
+    }
+    query(conn, sender).await.unwrap_or(false)
 }
 
 async fn check_polkit(
@@ -139,19 +217,20 @@ async fn check_polkit(
 
 /// DBus-supplied usernames are interpolated verbatim into root-owned filesystem
 /// paths (`/var/lib/sentinel/users/{}/` via `format!` in `GalleryStore::new` /
-/// `AdaptiveGallery::meta_path`), so any path metacharacter in a username turns
-/// an unprivileged caller into a root file read/write primitive. Only plain
-/// account names may reach the store layer.
+/// `AdaptiveGallery::meta_path`) and written into the audit log, so only plain
+/// account names may reach the store layer: letters, digits and `_ - . @`.
 fn validate_username(username: &str) -> Result<(), String> {
-    let invalid = username.is_empty()
-        || username.contains('/')
-        || username.contains('\\')
-        || username.contains("..")
-        || username.starts_with('.');
-    if invalid {
-        Err(format!("Rejected unsafe username: {:?}", username))
-    } else {
+    let valid = !username.is_empty()
+        && username.len() <= 64
+        && username
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '@'))
+        && !username.starts_with(['.', '-'])
+        && !username.contains("..");
+    if valid {
         Ok(())
+    } else {
+        Err(format!("Rejected unsafe username: {:?}", username))
     }
 }
 
@@ -168,6 +247,99 @@ fn uid_of_user(username: &str) -> Option<u32> {
             Some((*pw).pw_uid)
         }
     }
+}
+
+/// What one camera scan concluded.
+struct AuthOutcome {
+    result: &'static str,
+    tier: i32,
+    /// A real face was compared to the gallery (used by the attempt limiter).
+    face_evaluated: bool,
+}
+
+/// Run one face scan to completion. Blocking; called on a worker thread.
+fn run_auth_session(
+    config: &SentinelConfig,
+    models: &Mutex<Models>,
+    core_gallery: Vec<[f32; 512]>,
+    adaptive_gallery: Vec<[f32; 512]>,
+    username: String,
+) -> AuthOutcome {
+    let outcome = |result, tier, face_evaluated| AuthOutcome { result, tier, face_evaluated };
+
+    // The session clock starts now, so camera start-up counts towards the timeout.
+    let deadline = Instant::now() + Duration::from_secs_f64(config.security.global_session_timeout);
+    let mut authenticator =
+        SentinelAuthenticator::new(core_gallery, adaptive_gallery, username, config.clone());
+
+    // Camera first: it takes the longest to get going.
+    let camera = &config.camera;
+    let mut capture = match FrameCapture::with_format(&camera.source, camera.width, camera.height, camera.fps) {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("[DBus Authenticate] Camera init error: {} — falling back to password.", e);
+            return outcome("NO_FACE", 0, false);
+        }
+    };
+    if let Err(e) = capture.start() {
+        log::error!("[DBus Authenticate] Camera start error: {} — falling back to password.", e);
+        return outcome("NO_FACE", 0, false);
+    }
+
+    // One scan at a time: a second caller is told to use the password.
+    let mut models = match models.try_lock() {
+        Ok(m) => m,
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(TryLockError::WouldBlock) => {
+            log::warn!("[DBus Authenticate] Another scan is running — falling back to password.");
+            return outcome("NO_FACE", 0, false);
+        }
+    };
+    if models.spoof.is_none() {
+        log::error!("[DBus Authenticate] Anti-spoof model unavailable — face authentication is disabled.");
+        return outcome("NO_FACE", 0, false);
+    }
+    models.detector.configure(&config.detection);
+
+    let mut last_seq = 0u64;
+    let result = loop {
+        if capture.failed() {
+            // Still close the session properly, so a camera that "fails" after
+            // a face was judged counts towards the attempt limit.
+            let r = authenticator.expire();
+            break outcome("NO_FACE", 0, r.face_evaluated);
+        }
+        if Instant::now() >= deadline {
+            let r = authenticator.expire();
+            break outcome("TIMEOUT", 4, r.face_evaluated);
+        }
+        let frame = match capture.wait_new_frame(last_seq, Duration::from_millis(100)) {
+            Some(f) => f,
+            None => continue,
+        };
+        last_seq = frame.seq;
+
+        match authenticator.process_frame(&mut models, &frame) {
+            Ok(r) => match r.state {
+                AuthState::Waiting => {}
+                AuthState::Success => {
+                    let tier = if r.active_tier == Some(AuthTier::Golden) { 1 } else { 2 };
+                    break outcome("GRANTED", tier, true);
+                }
+                AuthState::Failure => break outcome("DENIED", 4, r.face_evaluated),
+                AuthState::Spoof => break outcome("SPOOF", 4, r.face_evaluated),
+                AuthState::Timeout => break outcome("TIMEOUT", 4, r.face_evaluated),
+                AuthState::NoFace => break outcome("NO_FACE", 0, r.face_evaluated),
+            },
+            // A frame that could not be processed is skipped; it never grants.
+            Err(e) => log::debug!("[DBus Authenticate] Frame skipped: {:#}", e),
+        }
+    };
+    drop(models);
+
+    // Switching the camera off takes a moment; the caller should not wait for it.
+    thread::spawn(move || drop(capture));
+    result
 }
 
 #[zbus::interface(name = "com.sentinel.Sentinel")]
@@ -213,179 +385,74 @@ impl SentinelService {
             )));
         }
 
-        // 1. Session Context Evaluation (SSH / Lid check)
-        if session_env.contains_key("SSH_CLIENT") || session_env.contains_key("SSH_TTY") {
-            println!("[DBus] Remote SSH session detected for user '{}' — bypassing camera.", username);
-            *self.last_auth_result.lock().unwrap() = "NO_FACE (SSH)".to_string();
-            let _ = Self::auth_status_changed(&ctxt, "NO_FACE", "Remote SSH session detected").await;
-            return Ok(("NO_FACE".to_string(), -1.0, 0));
+        // 1. Session Context Evaluation (remote session / lid check)
+        if session_env.contains_key("SSH_CLIENT")
+            || session_env.contains_key("SSH_TTY")
+            || is_remote_session(conn, sender.as_str()).await
+        {
+            return self.skip_scan(&ctxt, "Remote session").await;
         }
-
         if is_lid_closed() {
-            println!("[DBus] Laptop lid is closed for user '{}' — bypassing camera.", username);
-            *self.last_auth_result.lock().unwrap() = "NO_FACE (Lid Closed)".to_string();
-            let _ = Self::auth_status_changed(&ctxt, "NO_FACE", "Laptop lid closed").await;
-            return Ok(("NO_FACE".to_string(), -1.0, 0));
+            return self.skip_scan(&ctxt, "Lid Closed").await;
         }
 
-        // 2. Load Gallery Vectors
+        // 2. Attempt limit
+        if lock(&self.attempts).is_blocked(&username, Instant::now()) {
+            log::warn!("[DBus] Too many failed face attempts for '{}' — paused, password required.", username);
+            *lock(&self.last_auth_result) = "RATE_LIMITED".to_string();
+            let _ = Self::auth_status_changed(&ctxt, "RATE_LIMITED", "Too many failed attempts").await;
+            return Ok(("RATE_LIMITED".to_string(), -1.0, 0));
+        }
+
+        // 3. Load Gallery Vectors
         let store = GalleryStore::new(&username);
-        let gallery = store.all_vectors().map_err(|e| {
+        let core_gallery = store.load_core().map_err(|e| {
             zbus::fdo::Error::Failed(format!("Failed to load gallery for '{}': {}", username, e))
         })?;
+        if core_gallery.is_empty() {
+            return self.skip_scan(&ctxt, "No Enrolled Template").await;
+        }
+        let adaptive_gallery = store.load_adaptive().unwrap_or_else(|e| {
+            log::warn!("[DBus] Ignoring unreadable adaptive gallery for '{}': {:#}", username, e);
+            Vec::new()
+        });
 
-        if gallery.is_empty() {
-            println!("[DBus] No enrolled gallery vectors for user '{}' — failing open-safe.", username);
-            *self.last_auth_result.lock().unwrap() = "NO_FACE (No Enrolled Template)".to_string();
-            let _ = Self::auth_status_changed(&ctxt, "NO_FACE", "No enrolled template").await;
-            return Ok(("NO_FACE".to_string(), -1.0, 0));
+        let _ = Self::auth_status_changed(&ctxt, "SCANNING", "Looking for your face...").await;
+
+        // 4. Camera scan
+        let config = lock(&self.config).clone();
+        let models = Arc::clone(&self.models);
+        let user = username.clone();
+        let outcome = self
+            .rt_handle
+            .spawn_blocking(move || run_auth_session(&config, &models, core_gallery, adaptive_gallery, user))
+            .await
+            .map_err(|e| zbus::fdo::Error::Failed(format!("Auth task error: {}", e)))?;
+
+        // 5. Attempt accounting: sessions where a face was seen but not
+        //    granted count as failures; an empty room does not.
+        {
+            let mut attempts = lock(&self.attempts);
+            match outcome.result {
+                "GRANTED" => attempts.clear(&username),
+                _ if outcome.face_evaluated => attempts.record_failure(&username, Instant::now()),
+                _ => {}
+            }
         }
 
-        let _ = Self::auth_status_changed(&ctxt, "CALIBRATING", "Initializing camera and models...").await;
-
-        let config = self.config.lock().unwrap().clone();
-        let models_dir = self.models_dir.clone();
-        let last_auth_res = Arc::clone(&self.last_auth_result);
-
-        let (res_str, dist, tier) = self.rt_handle.spawn_blocking(move || {
-            let scrfd_path = models_dir.join("scrfd_500m_kps.onnx");
-            let mfn_path = models_dir.join("mobile_facenet.onnx");
-            let minifas_path = models_dir.join("MiniFASNetV2.onnx");
-
-            if !scrfd_path.exists() || !mfn_path.exists() {
-                eprintln!("[DBus Authenticate] ONNX models missing — failing open-safe.");
-                return ("NO_FACE".to_string(), -1.0, 0);
-            }
-
-            let detector = match ScrfdDetector::new_with_input_size(
-                scrfd_path.to_str().unwrap(),
-                config.detection.score_threshold,
-                config.detection.nms_threshold,
-                config.detection.min_face_size_px,
-                config.detection.scrfd_input_size,
-            ) {
-                Ok(d) => d,
-                Err(e) => {
-                    eprintln!("[DBus Authenticate] Detector init error: {} — failing open-safe.", e);
-                    return ("NO_FACE".to_string(), -1.0, 0);
-                }
-            };
-
-            let embedder = match MobileFaceNet::new(mfn_path.to_str().unwrap()) {
-                Ok(e) => e,
-                Err(e) => {
-                    eprintln!("[DBus Authenticate] Embedder init error: {} — failing open-safe.", e);
-                    return ("NO_FACE".to_string(), -1.0, 0);
-                }
-            };
-
-            let spoof = if minifas_path.exists() {
-                SpoofDetector::new(
-                    minifas_path.to_str().unwrap(),
-                    "/var/lib/sentinel/minifas_calib.json",
-                    config.security.spoof_threshold,
-                )
-                .ok()
-            } else {
-                None
-            };
-
-            let mut authenticator = SentinelAuthenticator::new_with_config(
-                detector,
-                embedder,
-                gallery,
-                username.clone(),
-                spoof,
-                config.clone(),
-            );
-
-            let mut capture = match FrameCapture::new(&config.camera.source) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("[DBus Authenticate] FrameCapture init error: {} — failing open-safe.", e);
-                    return ("NO_FACE".to_string(), -1.0, 0);
-                }
-            };
-
-            if let Err(e) = capture.start() {
-                eprintln!("[DBus Authenticate] FrameCapture start error: {} — failing open-safe.", e);
-                return ("NO_FACE".to_string(), -1.0, 0);
-            }
-
-            let start_time = Instant::now();
-            let timeout_secs = config.security.challenge_timeout_secs.max(20.0);
-
-            loop {
-                if start_time.elapsed().as_secs_f64() > timeout_secs {
-                    capture.stop();
-                    return ("TIMEOUT".to_string(), 1.0, 4);
-                }
-
-                let captured = match capture.read_captured_frame() {
-                    Some(f) => f,
-                    None => {
-                        thread::sleep(Duration::from_millis(15));
-                        continue;
-                    }
-                };
-
-                // Skip initial dark camera warmup frames (auto-exposure settling)
-                if captured.luma < 15.0 {
-                    thread::sleep(Duration::from_millis(20));
-                    continue;
-                }
-
-                match authenticator.process_frame(&captured.image) {
-                    Ok(r) => match r.state {
-                        AuthState::Success => {
-                            capture.stop();
-                            // Constant: never return the measured distance to
-                            // the caller — it is a similarity oracle against
-                            // the target user's templates (pam_sentinel
-                            // ignores the value).
-                            let dist = 0.0;
-                            let tier = match r.active_tier {
-                                Some(ActiveTier::Golden) => 1,
-                                Some(ActiveTier::Standard) => 2,
-                                Some(ActiveTier::TwoFactor) => 3,
-                                None => 4,
-                            };
-                            return ("GRANTED".to_string(), dist, tier);
-                        }
-                        AuthState::Failure => {
-                            capture.stop();
-                            // Constant: never return the measured distance.
-                            let dist = 1.0;
-                            let is_spoof = r.message.to_lowercase().contains("spoof");
-                            let res = if is_spoof { "SPOOF" } else { "DENIED" };
-                            return (res.to_string(), dist, 4);
-                        }
-                        AuthState::Require2FA => {
-                            capture.stop();
-                            // Constant: never return the measured distance.
-                            let dist = 0.45;
-                            return ("REQUIRE_2FA".to_string(), dist, 3);
-                        }
-                        AuthState::NoFace => {
-                            capture.stop();
-                            return ("NO_FACE".to_string(), -1.0, 0);
-                        }
-                        _ => {}
-                    },
-                    Err(_) => {
-                        thread::sleep(Duration::from_millis(33));
-                    }
-                }
-
-                thread::sleep(Duration::from_millis(30));
-            }
-        })
-        .await
-        .map_err(|e| zbus::fdo::Error::Failed(format!("Auth task error: {}", e)))?;
-
-        *last_auth_res.lock().unwrap() = format!("{} (d={:.4}, tier={})", res_str, dist, tier);
+        // Constant: never return the measured distance to the caller — it is
+        // a similarity oracle against the target user's templates
+        // (pam_sentinel ignores the value).
+        let dist = match outcome.result {
+            "GRANTED" => 0.0,
+            "NO_FACE" => -1.0,
+            _ => 1.0,
+        };
+        let res_str = outcome.result.to_string();
+        log::info!("[DBus] Authenticate for '{}': {} (tier {})", username, res_str, outcome.tier);
+        *lock(&self.last_auth_result) = format!("{} (tier={})", res_str, outcome.tier);
         let _ = Self::auth_status_changed(&ctxt, &res_str, &format!("Auth complete: {}", res_str)).await;
-        Ok((res_str, dist, tier))
+        Ok((res_str, dist, outcome.tier))
     }
 
     async fn start_enrollment(
@@ -397,6 +464,9 @@ impl SentinelService {
         check_polkit(conn, &header, "com.sentinel.enroll").await?;
         if let Err(e) = validate_username(&username) {
             return Err(zbus::fdo::Error::Failed(e));
+        }
+        if uid_of_user(&username).is_none() {
+            return Err(zbus::fdo::Error::Failed(format!("Unknown user '{}'", username)));
         }
 
         let owner = header
@@ -410,232 +480,124 @@ impl SentinelService {
             created_at: Instant::now(),
             username,
             pose_index: 0,
-            total_poses: 30,
+            total_poses: MAX_ENROLL_VECTORS,
             collected_embeddings: Vec::new(),
         };
 
-        *self.active_enrollment.lock().unwrap() = Some(session);
+        *lock(&self.active_enrollment) = Some(session);
         Ok(session_id)
     }
 
-    async fn submit_enrollment_frame(
-        &self,
-        #[zbus(header)] header: zbus::MessageHeader<'_>,
-        session_id: String,
-    ) -> zbus::fdo::Result<(String, i32, i32, Vec<f64>)> {
-        let (_pose_idx, _total_poses) = {
-            let lock = self.active_enrollment.lock().unwrap();
-            match lock.as_ref() {
-                Some(s) if self.enrollment_session_owned(s, &header, &session_id) => {
-                    (s.pose_index, s.total_poses)
-                }
-                _ => return Ok(("NO_SESSION".to_string(), 0, 30, Vec::new())),
-            }
-        };
-
-        let config = self.config.lock().unwrap().clone();
-        let models_dir = self.models_dir.clone();
-
-        let res = self.rt_handle.spawn_blocking(move || {
-            let scrfd_path = models_dir.join("scrfd_500m_kps.onnx");
-            let mfn_path = models_dir.join("mobile_facenet.onnx");
-
-            let mut detector = match ScrfdDetector::new_with_input_size(
-                scrfd_path.to_str().unwrap(),
-                0.35,
-                config.detection.nms_threshold,
-                config.detection.min_face_size_px,
-                config.detection.scrfd_input_size,
-            ) {
-                Ok(d) => d,
-                Err(_) => return ("NO_FACE".to_string(), None, Vec::new()),
-            };
-
-            let mut embedder = match MobileFaceNet::new(mfn_path.to_str().unwrap()) {
-                Ok(e) => e,
-                Err(_) => return ("NO_FACE".to_string(), None, Vec::new()),
-            };
-
-            let mut capture = match FrameCapture::new(&config.camera.source) {
-                Ok(c) => c,
-                Err(_) => return ("NO_FACE".to_string(), None, Vec::new()),
-            };
-
-            if capture.start().is_err() {
-                return ("NO_FACE".to_string(), None, Vec::new());
-            }
-
-            thread::sleep(Duration::from_millis(50));
-            let frame = match capture.read_captured_frame() {
-                Some(f) => f.image,
-                None => {
-                    capture.stop();
-                    return ("NO_FACE".to_string(), None, Vec::new());
-                }
-            };
-            capture.stop();
-
-            let det_res = match detector.detect_detailed(&frame) {
-                Ok(d) => d,
-                Err(_) => return ("NO_FACE".to_string(), None, Vec::new()),
-            };
-
-            if det_res.detections.len() > 1 {
-                return ("MULTIPLE_FACES".to_string(), None, Vec::new());
-            }
-
-            if det_res.detections.is_empty() {
-                return ("NO_FACE".to_string(), None, Vec::new());
-            }
-
-            let det = &det_res.detections[0];
-            let bw = (det.bbox[2] - det.bbox[0]).max(0.0);
-            if bw < config.detection.min_face_size_px as f32 {
-                return ("FACE_TOO_SMALL".to_string(), None, Vec::new());
-            }
-
-            let mut lm_vec = Vec::with_capacity(14);
-            lm_vec.push(det.bbox[0] as f64);
-            lm_vec.push(det.bbox[1] as f64);
-            lm_vec.push(det.bbox[2] as f64);
-            lm_vec.push(det.bbox[3] as f64);
-            for p in &det.landmarks {
-                lm_vec.push(p[0] as f64);
-                lm_vec.push(p[1] as f64);
-            }
-
-            if let Ok(aligned) = align_face(&frame, &det.landmarks) {
-                if let Ok(emb) = embedder.embed(&aligned) {
-                    return ("ACCEPTED".to_string(), Some(emb), lm_vec);
-                }
-            }
-
-            ("NO_FACE".to_string(), None, lm_vec)
-        })
-        .await
-        .map_err(|e| zbus::fdo::Error::Failed(format!("Task panic: {}", e)))?;
-
-        let (status_str, emb_opt, lm_vec) = res;
-        let mut lock = self.active_enrollment.lock().unwrap();
-        if let Some(s) = lock
-            .as_mut()
-            .filter(|s| self.enrollment_session_owned(s, &header, &session_id))
-        {
-            if let Some(emb) = emb_opt {
-                // Daemon-side diversity check: cosine distance > 0.05 against existing embeddings
-                let is_too_similar = s.collected_embeddings.iter().any(|existing| {
-                    let dot: f32 = existing.iter().zip(emb.iter()).map(|(a, b)| a * b).sum();
-                    let cos_dist = 1.0 - dot;
-                    cos_dist <= 0.05
-                });
-
-                if is_too_similar {
-                    return Ok(("TOO_SIMILAR".to_string(), s.pose_index as i32, s.total_poses as i32, lm_vec));
-                }
-
-                s.collected_embeddings.push(emb);
-                s.pose_index += 1;
-            }
-            Ok((status_str, s.pose_index as i32, s.total_poses as i32, lm_vec))
-        } else {
-            Ok(("NO_SESSION".to_string(), 0, 30, Vec::new()))
-        }
-    }
-
+    /// Check one camera frame (JPEG/PNG bytes) sent by the enrollment wizard.
+    ///
+    /// With `capture = false` the frame is only inspected, for the live
+    /// preview. With `capture = true` a good frame is stored as a template.
+    ///
+    /// Returns `(status, templates collected, maximum, [bbox x1,y1,x2,y2, 5 landmarks x,y])`.
+    /// Status is `ACCEPTED`, or why not: `NO_FACE`, `MULTIPLE_FACES`,
+    /// `OUT_OF_FRAME`, `NOT_FRONTAL`, `TOO_DARK`, `TOO_BRIGHT`, `BLURRY`,
+    /// `TOO_SIMILAR`, `FULL`, `DECODE_ERROR`, `NO_SESSION`.
     async fn submit_enrollment_frame_data(
         &self,
         #[zbus(header)] header: zbus::MessageHeader<'_>,
         session_id: String,
         frame_data: Vec<u8>,
+        capture: bool,
     ) -> zbus::fdo::Result<(String, i32, i32, Vec<f64>)> {
-        let (_pose_idx, _total_poses) = {
-            let lock = self.active_enrollment.lock().unwrap();
-            match lock.as_ref() {
-                Some(s) if self.enrollment_session_owned(s, &header, &session_id) => {
-                    (s.pose_index, s.total_poses)
-                }
-                _ => return Ok(("NO_SESSION".to_string(), 0, 30, Vec::new())),
+        let no_session = || Ok(("NO_SESSION".to_string(), 0, MAX_ENROLL_VECTORS as i32, Vec::new()));
+        {
+            let session = lock(&self.active_enrollment);
+            match session.as_ref() {
+                Some(s) if self.enrollment_session_owned(s, &header, &session_id) => {}
+                _ => return no_session(),
             }
-        };
+        }
 
-        let config = self.config.lock().unwrap().clone();
-        let models_dir = self.models_dir.clone();
+        let config = lock(&self.config).clone();
+        let models = Arc::clone(&self.models);
 
         let res = self.rt_handle.spawn_blocking(move || {
-            let scrfd_path = models_dir.join("scrfd_500m_kps.onnx");
-            let mfn_path = models_dir.join("mobile_facenet.onnx");
-
             let img = match image::load_from_memory(&frame_data) {
                 Ok(i) => i.to_rgb8(),
-                Err(_) => return ("DECODE_ERROR".to_string(), None, Vec::new()),
+                Err(_) => return ("DECODE_ERROR", None, Vec::new()),
             };
 
-            let mut detector = match ScrfdDetector::new_with_input_size(
-                scrfd_path.to_str().unwrap(),
-                0.5,
-                config.detection.nms_threshold,
-                config.detection.min_face_size_px,
-                640,
-            ) {
+            let mut models = lock(&models);
+            models.detector.configure(&config.detection);
+            let detections = match models.detector.detect(&img) {
                 Ok(d) => d,
-                Err(_) => return ("NO_FACE".to_string(), None, Vec::new()),
+                Err(_) => return ("NO_FACE", None, Vec::new()),
             };
-
-            let mut embedder = match MobileFaceNet::new(mfn_path.to_str().unwrap()) {
-                Ok(e) => e,
-                Err(_) => return ("NO_FACE".to_string(), None, Vec::new()),
-            };
-
-            let det_res = match detector.detect_detailed(&img) {
-                Ok(d) => d,
-                Err(_) => return ("NO_FACE".to_string(), None, Vec::new()),
-            };
-
-            if det_res.detections.len() > 1 {
-                return ("MULTIPLE_FACES".to_string(), None, Vec::new());
+            if detections.len() > 1 {
+                return ("MULTIPLE_FACES", None, Vec::new());
             }
-
-            if det_res.detections.is_empty() {
-                return ("NO_FACE".to_string(), None, Vec::new());
-            }
-
-            let det = &det_res.detections[0];
+            let det = match detections.first() {
+                Some(d) => d,
+                None => return ("NO_FACE", None, Vec::new()),
+            };
 
             let mut bbox_lm_vec = Vec::with_capacity(14);
-            bbox_lm_vec.push(det.bbox[0] as f64);
-            bbox_lm_vec.push(det.bbox[1] as f64);
-            bbox_lm_vec.push(det.bbox[2] as f64);
-            bbox_lm_vec.push(det.bbox[3] as f64);
+            bbox_lm_vec.extend(det.bbox.iter().map(|v| *v as f64));
             for p in &det.landmarks {
                 bbox_lm_vec.push(p[0] as f64);
                 bbox_lm_vec.push(p[1] as f64);
             }
 
-            if let Ok(aligned) = align_face(&img, &det.landmarks) {
-                if let Ok(emb) = embedder.embed(&aligned) {
-                    return ("ACCEPTED".to_string(), Some(emb), bbox_lm_vec);
-                }
+            // Same quality gate as authentication: a template is only useful
+            // if it looks like the frames it will later be compared with.
+            let status_of = |issue: quality::QualityIssue| match issue {
+                quality::QualityIssue::OutOfFrame => "OUT_OF_FRAME",
+                quality::QualityIssue::NotFrontal => "NOT_FRONTAL",
+                quality::QualityIssue::TooDark => "TOO_DARK",
+                quality::QualityIssue::TooBright => "TOO_BRIGHT",
+                quality::QualityIssue::Blurry => "BLURRY",
+            };
+            if let Err(issue) = quality::check_pose(&det.landmarks, img.width(), img.height()) {
+                return (status_of(issue), None, bbox_lm_vec);
+            }
+            let aligned = match align_face(&img, &det.landmarks) {
+                Ok(a) => a,
+                Err(_) => return ("NO_FACE", None, bbox_lm_vec),
+            };
+            if let Err(issue) = quality::check_aligned_face(&aligned) {
+                return (status_of(issue), None, bbox_lm_vec);
+            }
+            if !capture {
+                return ("ACCEPTED", None, bbox_lm_vec);
             }
 
-            ("NO_FACE".to_string(), None, bbox_lm_vec)
+            match models.embedder.embed_with_flip(&aligned) {
+                Ok(emb) => ("ACCEPTED", Some(emb), bbox_lm_vec),
+                Err(_) => ("NO_FACE", None, bbox_lm_vec),
+            }
         })
         .await
         .map_err(|e| zbus::fdo::Error::Failed(format!("Task panic: {}", e)))?;
 
-        let (status_str, emb_opt, bbox_lm_vec) = res;
-        let mut lock = self.active_enrollment.lock().unwrap();
-        if let Some(s) = lock
+        let (mut status, emb_opt, bbox_lm_vec) = res;
+        let mut session = lock(&self.active_enrollment);
+        let s = match session
             .as_mut()
             .filter(|s| self.enrollment_session_owned(s, &header, &session_id))
         {
-            if let Some(emb) = emb_opt {
+            Some(s) => s,
+            None => return no_session(),
+        };
+
+        if let Some(emb) = emb_opt {
+            let is_duplicate = s.collected_embeddings.iter().any(|existing| {
+                crate::pipeline::cosine_distance(existing, &emb) <= DUPLICATE_DISTANCE
+            });
+            if s.collected_embeddings.len() >= MAX_ENROLL_VECTORS {
+                status = "FULL";
+            } else if is_duplicate {
+                status = "TOO_SIMILAR";
+            } else {
                 s.collected_embeddings.push(emb);
                 s.pose_index += 1;
             }
-            Ok((status_str, s.pose_index as i32, s.total_poses as i32, bbox_lm_vec))
-        } else {
-            Ok(("NO_SESSION".to_string(), 0, 30, Vec::new()))
         }
+        Ok((status.to_string(), s.pose_index as i32, s.total_poses as i32, bbox_lm_vec))
     }
 
     async fn finish_enrollment(
@@ -644,7 +606,7 @@ impl SentinelService {
         session_id: String,
     ) -> zbus::fdo::Result<(bool, String)> {
         let session = {
-            let mut lock = self.active_enrollment.lock().unwrap();
+            let mut lock = lock(&self.active_enrollment);
             let matches = lock
                 .as_ref()
                 .map(|s| self.enrollment_session_owned(s, &header, &session_id))
@@ -656,17 +618,24 @@ impl SentinelService {
             }
         };
 
-        if session.collected_embeddings.len() < 15 {
+        if session.collected_embeddings.len() < MIN_ENROLL_VECTORS {
             return Ok((
                 false,
                 format!(
-                    "Insufficient embeddings: collected {} (minimum 15 required)",
-                    session.collected_embeddings.len()
+                    "Insufficient embeddings: collected {} (minimum {} required)",
+                    session.collected_embeddings.len(),
+                    MIN_ENROLL_VECTORS
                 ),
             ));
         }
 
+        // A new enrollment replaces the identity: templates learned for the
+        // previous one must not keep granting access. They are removed first,
+        // so a failure here can never leave them next to a new enrollment.
         let store = GalleryStore::new(&session.username);
+        if let Err(e) = store.clear_adaptive() {
+            return Ok((false, format!("Failed to clear learned templates: {}", e)));
+        }
         if let Err(e) = store.save_core(&session.collected_embeddings) {
             return Ok((false, format!("Failed to save gallery: {}", e)));
         }
@@ -688,22 +657,7 @@ impl SentinelService {
         lines: u32,
     ) -> zbus::fdo::Result<Vec<String>> {
         check_polkit(conn, &header, "com.sentinel.get_auth_log").await?;
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        let log_path = format!("/var/log/sentinel/auth_{}.log", today);
-
-        let content = std::fs::read_to_string(&log_path).unwrap_or_default();
-
-        let result: Vec<String> = content
-            .lines()
-            .rev()
-            .take(lines as usize)
-            .map(String::from)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-
-        Ok(result)
+        Ok(crate::audit::AuditLogger::new().recent_lines((lines as usize).min(1000)))
     }
 
     async fn cancel_enrollment(
@@ -711,7 +665,7 @@ impl SentinelService {
         #[zbus(header)] header: zbus::MessageHeader<'_>,
         session_id: String,
     ) -> zbus::fdo::Result<()> {
-        let mut lock = self.active_enrollment.lock().unwrap();
+        let mut lock = lock(&self.active_enrollment);
         if let Some(ref s) = *lock {
             if self.enrollment_session_owned(s, &header, &session_id) {
                 *lock = None;
@@ -749,7 +703,7 @@ impl SentinelService {
         let user_dir = PathBuf::from("/var/lib/sentinel/users").join(&username);
         if user_dir.exists() {
             if let Err(e) = std::fs::remove_dir_all(&user_dir) {
-                eprintln!("[DBus RemoveUser] Error removing {}: {}", user_dir.display(), e);
+                log::error!("[DBus RemoveUser] Error removing {}: {}", user_dir.display(), e);
                 return Ok(false);
             }
             Ok(true)
@@ -763,44 +717,32 @@ impl SentinelService {
             return Err(zbus::fdo::Error::InvalidArgs(e));
         }
 
-        let base = std::fs::canonicalize("/var/lib/sentinel/users")
-            .unwrap_or_else(|_| PathBuf::from("/var/lib/sentinel/users"));
-        let meta_path = match std::fs::canonicalize(
-            PathBuf::from("/var/lib/sentinel/users").join(&username).join("meta.json"),
-        ) {
-            Ok(p) if p.starts_with(&base) => p,
-            _ => {
-                let default_meta = serde_json::json!({
-                    "username": username,
-                    "core_vector_count": 0,
-                    "adaptive_vector_count": 0,
-                    "last_adaptation_date": "N/A",
-                    "enrolled_at": "N/A"
-                });
-                return Ok(default_meta.to_string());
-            }
+        let store = GalleryStore::new(&username);
+        let core_count = store.load_core().map(|v| v.len()).unwrap_or(0);
+        let adaptive_count = store.load_adaptive().map(|v| v.len()).unwrap_or(0);
+        let meta = crate::gallery::AdaptiveGallery::load_meta(&username);
+        let enrolled_at = std::fs::metadata(store.base_path.join("gallery.npy"))
+            .and_then(|m| m.modified())
+            .map(|t| chrono::DateTime::<chrono::Local>::from(t).format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_else(|_| "N/A".to_string());
+        let last_adaptation = if meta.last_adaptation_date.is_empty() {
+            "N/A".to_string()
+        } else {
+            meta.last_adaptation_date
         };
 
-        if meta_path.exists() {
-            match std::fs::read_to_string(&meta_path) {
-                Ok(content) => Ok(content),
-                Err(e) => Err(zbus::fdo::Error::Failed(format!("Failed to read metadata: {}", e))),
-            }
-        } else {
-            let default_meta = serde_json::json!({
-                "username": username,
-                "core_vector_count": 0,
-                "adaptive_vector_count": 0,
-                "last_adaptation_date": "N/A",
-                "enrolled_at": "N/A"
-            });
-            Ok(default_meta.to_string())
-        }
+        Ok(serde_json::json!({
+            "username": username,
+            "core_vector_count": core_count,
+            "adaptive_vector_count": adaptive_count,
+            "last_adaptation_date": last_adaptation,
+            "enrolled_at": enrolled_at
+        })
+        .to_string())
     }
 
-
     async fn get_config(&self) -> zbus::fdo::Result<String> {
-        let config = self.config.lock().unwrap();
+        let config = lock(&self.config);
         toml::to_string(&*config)
             .map_err(|e| zbus::fdo::Error::Failed(format!("TOML serialize error: {}", e)))
     }
@@ -813,24 +755,27 @@ impl SentinelService {
     ) -> zbus::fdo::Result<(bool, String)> {
         check_polkit(conn, &header, "com.sentinel.set_config").await?;
 
-        let new_config: SentinelConfig = match toml::from_str(&config_toml) {
+        // Parses and range-checks: a value that would weaken authentication
+        // (or a camera source that is not a device node) never reaches disk.
+        let new_config = match SentinelConfig::from_toml(&config_toml) {
             Ok(c) => c,
-            Err(e) => return Ok((false, format!("Invalid TOML: {}", e))),
+            Err(e) => return Ok((false, format!("Invalid configuration: {:#}", e))),
         };
 
-        if let Err(e) = std::fs::write(&self.config_path, &config_toml) {
-            return Ok((false, format!("Failed to write config file: {}", e)));
+        if let Err(e) = crate::fsutil::write_atomic(&self.config_path, config_toml.as_bytes(), 0o644) {
+            return Ok((false, format!("Failed to write config file: {:#}", e)));
         }
 
-        *self.config.lock().unwrap() = new_config;
+        *lock(&self.config) = new_config;
         Ok((true, "Configuration updated successfully".to_string()))
     }
 
     async fn get_status(&self) -> zbus::fdo::Result<String> {
         let uptime = self.start_time.elapsed().as_secs();
-        let scrfd_loaded = self.models_dir.join("scrfd_500m_kps.onnx").exists();
-        let mfn_loaded = self.models_dir.join("mobile_facenet.onnx").exists();
-        let spoof_loaded = self.models_dir.join("MiniFASNetV2.onnx").exists();
+        // The detector and embedder are loaded at start-up or the daemon exits.
+        let scrfd_loaded = true;
+        let mfn_loaded = true;
+        let spoof_loaded = self.spoof_available;
 
         let gallery_dir = PathBuf::from("/var/lib/sentinel/users");
         let mut enrolled_users_count = 0usize;
@@ -842,8 +787,8 @@ impl SentinelService {
             }
         }
 
-        let config = self.config.lock().unwrap();
-        let last_res = self.last_auth_result.lock().unwrap().clone();
+        let config = lock(&self.config);
+        let last_res = lock(&self.last_auth_result).clone();
 
         let status_json = serde_json::json!({
             "daemon_uptime_secs": uptime,
@@ -913,104 +858,6 @@ impl SentinelService {
         Ok(())
     }
 
-    /// Reset anti-spoof calibration by deleting /var/lib/sentinel/minifas_calib.json
-    async fn reset_spoof_calibration(
-        &self,
-        #[zbus(header)] header: zbus::MessageHeader<'_>,
-        #[zbus(connection)] conn: &zbus::Connection,
-    ) -> zbus::fdo::Result<bool> {
-        check_polkit(conn, &header, "com.sentinel.reset_calibration").await?;
-
-        let calib_path = std::path::Path::new("/var/lib/sentinel/minifas_calib.json");
-        if calib_path.exists() {
-            std::fs::remove_file(calib_path)
-                .map_err(|e| zbus::fdo::Error::Failed(format!("Failed to delete calibration file: {}", e)))?;
-        }
-        println!("[DBus] ResetSpoofCalibration: Deleted /var/lib/sentinel/minifas_calib.json");
-        Ok(true)
-    }
-
-    /// Open camera, capture ~80 frames, run MiniFASNet self-calibration loop, save result, and return JSON string
-    async fn run_spoof_calibration(
-        &self,
-        #[zbus(header)] header: zbus::MessageHeader<'_>,
-        #[zbus(connection)] conn: &zbus::Connection,
-    ) -> zbus::fdo::Result<String> {
-        check_polkit(conn, &header, "com.sentinel.reset_calibration").await?;
-
-        let config = self.config.lock().unwrap().clone();
-        let models_dir = self.models_dir.clone();
-
-        let res_json = self.rt_handle.spawn_blocking(move || {
-            let scrfd_path = models_dir.join("scrfd_500m_kps.onnx");
-            let minifas_path = models_dir.join("MiniFASNetV2.onnx");
-            let calib_path = "/var/lib/sentinel/minifas_calib.json";
-
-            let _ = std::fs::remove_file(calib_path);
-
-            if !scrfd_path.exists() || !minifas_path.exists() {
-                return Err(zbus::fdo::Error::Failed("Required ONNX models missing".to_string()));
-            }
-
-            let mut detector = ScrfdDetector::new_with_input_size(
-                scrfd_path.to_str().unwrap(),
-                config.detection.score_threshold,
-                config.detection.nms_threshold,
-                config.detection.min_face_size_px,
-                config.detection.scrfd_input_size,
-            ).map_err(|e| zbus::fdo::Error::Failed(format!("Detector init error: {}", e)))?;
-
-            let mut spoof = SpoofDetector::new(
-                minifas_path.to_str().unwrap(),
-                calib_path,
-                config.security.spoof_threshold,
-            ).map_err(|e| zbus::fdo::Error::Failed(format!("SpoofDetector init error: {}", e)))?;
-
-            let mut capture = FrameCapture::new(&config.camera.source)
-                .map_err(|e| zbus::fdo::Error::Failed(format!("Camera init error: {}", e)))?;
-            capture.start().map_err(|e| zbus::fdo::Error::Failed(format!("Camera start error: {}", e)))?;
-
-            let start = Instant::now();
-            let timeout = Duration::from_secs(40);
-
-            while spoof.is_calibrating() && start.elapsed() < timeout {
-                let captured = match capture.read_captured_frame() {
-                    Some(f) => f,
-                    None => {
-                        thread::sleep(Duration::from_millis(15));
-                        continue;
-                    }
-                };
-
-                if captured.luma < 15.0 {
-                    thread::sleep(Duration::from_millis(20));
-                    continue;
-                }
-
-                if let Ok(detections) = detector.detect(&captured.image) {
-                    if !detections.is_empty() {
-                        let bbox = detections[0].bbox;
-                        if let Ok(crop) = SpoofDetector::square_crop(&captured.image, bbox, 1.5) {
-                            spoof.calibrate_tick(&crop);
-                        }
-                    }
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
-
-            capture.stop();
-
-            if std::path::Path::new(calib_path).exists() {
-                let json_content = std::fs::read_to_string(calib_path).unwrap_or_else(|_| "{}".to_string());
-                Ok(json_content)
-            } else {
-                Err(zbus::fdo::Error::Failed("Calibration timed out or failed to save".to_string()))
-            }
-        }).await.map_err(|e| zbus::fdo::Error::Failed(format!("Spawn error: {}", e)))??;
-
-        Ok(res_json)
-    }
-
     #[zbus(signal)]
     async fn auth_status_changed(
         ctxt: &zbus::SignalContext<'_>,
@@ -1051,7 +898,7 @@ mod tests {
             created_at: Instant::now(),
             username: "alice".to_string(),
             pose_index: 0,
-            total_poses: 30,
+            total_poses: MAX_ENROLL_VECTORS,
             collected_embeddings: Vec::new(),
         };
 
@@ -1072,7 +919,7 @@ mod tests {
             created_at: Instant::now() - Duration::from_secs(1801),
             username: "alice".to_string(),
             pose_index: 0,
-            total_poses: 30,
+            total_poses: MAX_ENROLL_VECTORS,
             collected_embeddings: Vec::new(),
         };
         assert!(!SentinelService::is_session_valid(&expired_session, Some(":1.42"), "enroll_alice_testtoken123"));
@@ -1083,6 +930,14 @@ mod tests {
         assert!(validate_username("alice").is_ok());
         assert!(validate_username("bob_123").is_ok());
         assert!(validate_username("carol-dev").is_ok());
+        assert!(validate_username("dave.smith@example.org").is_ok());
+
+        // Characters that would break the pipe-separated audit log or paths.
+        assert!(validate_username("mallory|GRANTED").is_err());
+        assert!(validate_username("mallory\nroot").is_err());
+        assert!(validate_username("mal lory").is_err());
+        assert!(validate_username("-rf").is_err());
+        assert!(validate_username(&"a".repeat(65)).is_err());
 
         assert!(validate_username("").is_err());
         assert!(validate_username("../../../../tmp/evil").is_err());

@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 import dbus
 import dbus.mainloop.glib
 from gi.repository import GLib
@@ -35,16 +36,13 @@ class SentinelDBusClient:
         session_id = self.iface.StartEnrollment(username)
         return str(session_id)
 
-    def submit_enrollment_frame(self, session_id: str) -> tuple[str, int, int, list[float]]:
-        # Returns (status, pose_index, total_poses, landmarks_vec)
-        status, pose_idx, total_poses, lms = self.iface.SubmitEnrollmentFrame(session_id)
-        landmarks = [float(x) for x in lms]
-        return str(status), int(pose_idx), int(total_poses), landmarks
-
-    def submit_enrollment_frame_data(self, session_id: str, frame_data: bytes) -> tuple[str, int, int, list[float]]:
-        # Encoded JPEG bytes passed to daemon without camera device contention
+    def submit_enrollment_frame_data(self, session_id: str, frame_data: bytes, capture: bool = False) -> tuple[str, int, int, list[float]]:
+        # Encoded JPEG bytes passed to daemon without camera device contention.
+        # capture=False only checks the frame (live preview); capture=True
+        # stores it as a template when the returned status is "ACCEPTED".
         byte_array = dbus.ByteArray(frame_data)
-        status, pose_idx, total_poses, lms = self.iface.SubmitEnrollmentFrameData(session_id, byte_array)
+        status, pose_idx, total_poses, lms = self.iface.SubmitEnrollmentFrameData(
+            session_id, byte_array, dbus.Boolean(capture))
         landmarks = [float(x) for x in lms]
         return str(status), int(pose_idx), int(total_poses), landmarks
 
@@ -81,17 +79,28 @@ class SentinelDBusClient:
         res = self.iface.SetConfig(toml_string)
         return bool(res[0]), str(res[1])
 
-    def reset_spoof_calibration(self) -> bool:
-        res = self.iface.ResetSpoofCalibration()
-        return bool(res)
-
-    def run_spoof_calibration(self) -> str:
-        res = self.iface.RunSpoofCalibration()
-        return str(res)
-
     def get_recent_auth_log(self, lines: int = 10) -> list[str]:
         logs = self.iface.GetRecentAuthLog(dbus.UInt32(lines))
         return [str(l) for l in logs]
+
+    def last_auth_scores(self, since: float) -> str:
+        """Real match distance and anti-spoof score of the scan that just finished.
+
+        Authenticate never returns them (any caller could then probe a face
+        template), so they are read from the audit log, which only an active
+        local user or an administrator may see. `since` is time.time() from
+        just before the scan; scans that write no audit line (nobody in view,
+        attempt limit) give "n/a".
+        """
+        try:
+            lines = self.get_recent_auth_log(1)
+            ts, _user, _result, distance, _tier, _liveness, spoof, _ms = lines[-1].split("|")[:8]
+            when = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc).timestamp()
+            if when < since - 1.0:
+                return "distance n/a"
+            return f"distance {distance}, anti-spoof {spoof}"
+        except Exception:
+            return "distance n/a"
 
     def listen_auth_status(self, callback_func):
         """Subscribe to AuthStatusChanged signals and run callback_func(status, message)."""

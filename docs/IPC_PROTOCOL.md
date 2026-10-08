@@ -31,9 +31,14 @@ Legacy iterations attempted custom Unix domain sockets with JSON-RPC messaging. 
     <!-- Primary Authentication Method (Called by PAM module) -->
     <method name="Authenticate">
       <arg name="username" type="s" direction="in"/>
-      <!-- Returns: "GRANTED" | "DENIED" | "REQUIRE_2FA" | "TIMEOUT" | "NO_FACE" | "SPOOF" -->
+      <!-- Caller's SSH_CLIENT / SSH_TTY, if set (advisory; logind is the authority) -->
+      <arg name="session_env" type="a{ss}" direction="in"/>
+      <!-- Returns: "GRANTED" | "DENIED" | "SPOOF" | "TIMEOUT" | "NO_FACE" | "RATE_LIMITED" -->
       <arg name="result" type="s" direction="out"/>
+      <!-- Constant per result (0.0 granted, -1.0 no scan, 1.0 otherwise): the real
+           match distance is never returned, it would let callers probe a template -->
       <arg name="distance" type="d" direction="out"/>
+      <!-- 1 = strong match, 2 = normal match, 4 = not granted, 0 = no scan -->
       <arg name="tier" type="i" direction="out"/>
     </method>
 
@@ -43,12 +48,19 @@ Legacy iterations attempted custom Unix domain sockets with JSON-RPC messaging. 
       <arg name="session_id" type="s" direction="out"/>
     </method>
 
-    <method name="SubmitEnrollmentFrame">
+    <!-- The wizard owns the camera and sends JPEG/PNG frames.
+         capture=false: inspect only (live preview). capture=true: store as a template. -->
+    <method name="SubmitEnrollmentFrameData">
       <arg name="session_id" type="s" direction="in"/>
-      <!-- Status: "ACCEPTED" | "FACE_TOO_SMALL" | "MULTIPLE_FACES" | "NO_FACE" | "COMPLETE" -->
+      <arg name="frame_data" type="ay" direction="in"/>
+      <arg name="capture" type="b" direction="in"/>
+      <!-- Status: "ACCEPTED" | "NO_FACE" | "MULTIPLE_FACES" | "OUT_OF_FRAME" | "NOT_FRONTAL" |
+           "TOO_DARK" | "TOO_BRIGHT" | "BLURRY" | "TOO_SIMILAR" | "FULL" | "DECODE_ERROR" | "NO_SESSION" -->
       <arg name="status" type="s" direction="out"/>
-      <arg name="pose_index" type="i" direction="out"/>
-      <arg name="total_poses" type="i" direction="out"/>
+      <arg name="templates_collected" type="i" direction="out"/>
+      <arg name="templates_max" type="i" direction="out"/>
+      <!-- [bbox x1,y1,x2,y2, then 5 landmarks x,y] of the detected face, or empty -->
+      <arg name="bbox_and_landmarks" type="ad" direction="out"/>
     </method>
 
     <method name="FinishEnrollment">
@@ -94,6 +106,22 @@ Legacy iterations attempted custom Unix domain sockets with JSON-RPC messaging. 
       <arg name="filename" type="s" direction="in"/>
     </method>
 
+    <method name="GetUserInfo">
+      <arg name="username" type="s" direction="in"/>
+      <!-- JSON: username, core_vector_count, adaptive_vector_count, last_adaptation_date, enrolled_at -->
+      <arg name="info_json" type="s" direction="out"/>
+    </method>
+
+    <!-- Newest audit lines (at most 1000), oldest first, read across the daily log files -->
+    <method name="GetRecentAuthLog">
+      <arg name="lines" type="u" direction="in"/>
+      <arg name="log_lines" type="as" direction="out"/>
+    </method>
+
+    <method name="GetGreeterInfo">
+      <arg name="info_json" type="s" direction="out"/>
+    </method>
+
     <!-- Real-time Event Signals -->
     <signal name="AuthStatusChanged">
       <arg name="status" type="s"/>
@@ -112,12 +140,12 @@ File: `packaging/com.sentinel.policy`
 
 | Method / Action | Policy Rule (`auth_admin` / `yes`) | Justification |
 |---|---|---|
-| `Authenticate` | `yes` (Allow any local user) | Required so GDM and unprivileged PAM invocations can verify faces. |
+| `Authenticate` | no PolicyKit; caller must be root or the target user | Required so PAM invocations (root for login/sudo, the user for lock screens) can verify faces, while nobody can probe another user's template. |
 | `GetStatus` | `yes` | Allows unprivileged status checks via `sentinel status`. |
 | `ListUsers` | `yes` | Non-sensitive query for local user listing. |
 | `StartEnrollment` | `auth_admin_keep` | Prevents unauthorized users from registering biometric identity templates. |
 | `RemoveUser` | `auth_admin` | Requires administrative escalation to delete biometric data. |
-| `SetConfig` | `auth_admin` | Administrative change to core thresholds or hardware sources. |
+| `SetConfig` | `auth_admin` | Administrative change to core thresholds or hardware sources. Values are range-checked before they are saved. |
 | `GetIntrusionList` | `auth_admin_keep` | Reviewing recorded intrusion attempt screenshots. |
 
 ---
@@ -129,7 +157,7 @@ File: `packaging/com.sentinel.policy`
 busctl call com.sentinel.Sentinel /com/sentinel/Sentinel com.sentinel.Sentinel GetStatus
 
 # Trigger test authentication for user '$USER'
-busctl call com.sentinel.Sentinel /com/sentinel/Sentinel com.sentinel.Sentinel Authenticate s "$USER"
+busctl call com.sentinel.Sentinel /com/sentinel/Sentinel com.sentinel.Sentinel Authenticate "sa{ss}" "$USER" 0
 
 # Monitor real-time status signals
 busctl monitor com.sentinel.Sentinel

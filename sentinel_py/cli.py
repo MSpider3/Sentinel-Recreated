@@ -5,7 +5,7 @@ import argparse
 import json
 import time
 from sentinel_py.dbus_client import SentinelDBusClient
-from sentinel_py.enroll import EnrollmentWizard
+from sentinel_py.enroll import EnrollmentWizard, ask_glasses
 
 def get_current_user() -> str:
     return os.environ.get("SUDO_USER") or os.environ.get("USER") or getpass.getuser()
@@ -61,15 +61,7 @@ def cmd_auth(client: SentinelDBusClient, args):
     username = args.username or get_current_user()
     print(f"=== Sentinel One-Shot Diagnostic Authentication ===")
     print(f"Target User: {username}")
-    print("Listening for real-time AuthStatusChanged signals...")
-
-    def on_status_changed(status, message):
-        print(f"  [SIGNAL] Status: {status:<15} | Message: {message}")
-
-    try:
-        client.listen_auth_status(on_status_changed)
-    except Exception as e:
-        print(f"  [Notice] Signal listener warning: {e}")
+    print("Look at the camera...")
 
     start_t = time.time()
     try:
@@ -77,8 +69,8 @@ def cmd_auth(client: SentinelDBusClient, args):
         elapsed = time.time() - start_t
         print("\n=======================================================")
         print(f"AUTHENTICATION RESULT: {res}")
-        print(f"Cosine Distance:      {dist:.4f}")
         print(f"Security Tier:        {tier}")
+        print(f"Scores (audit log):   {client.last_auth_scores(start_t)}")
         print(f"Total Response Time:  {elapsed:.2f}s")
         print("=======================================================")
     except Exception as e:
@@ -87,11 +79,9 @@ def cmd_auth(client: SentinelDBusClient, args):
 
 def cmd_enroll(client: SentinelDBusClient, args):
     username = args.username or get_current_user()
-    wizard = EnrollmentWizard(
-        username=username,
-        glasses=args.glasses,
-        append_glasses=args.append_glasses
-    )
+    # No flag given: ask, rather than silently assuming "no glasses".
+    glasses = args.glasses if args.glasses is not None else ask_glasses()
+    wizard = EnrollmentWizard(username=username, glasses=glasses)
     success = wizard.run()
     sys.exit(0 if success else 1)
 
@@ -99,81 +89,6 @@ def cmd_dashboard(client: SentinelDBusClient, args):
     from sentinel_py.tui.app import SentinelApp
     app = SentinelApp()
     app.run()
-
-def cmd_calibrate_spoof(client: SentinelDBusClient, args):
-    username = args.username or get_current_user()
-    print("=== Sentinel MiniFASNet Dedicated Anti-Spoof Calibration ===")
-    print("[1/4] Resetting existing calibration via DBus...")
-    try:
-        client.reset_spoof_calibration()
-        print("  ✓ Cleared previous calibration file (/var/lib/sentinel/minifas_calib.json)")
-    except Exception as e:
-        print(f"  Notice during reset: {e}")
-
-    print("\n[2/4] Running MiniFASNet self-calibration (~80 frames)...")
-    print("      Look directly at the camera with your live face...")
-    try:
-        calib_res = client.run_spoof_calibration()
-        print(f"  ✓ Self-calibration completed successfully.")
-        print(f"    Saved configuration: {calib_res}")
-    except Exception as e:
-        print(f"  Error running calibration: {e}")
-        sys.exit(1)
-
-    print("\n[3/4] Running 5 live face verification checks...")
-    latest_score = [None]
-
-    def on_status_changed(status, message):
-        for tag in ["spoof_score=", "conf="]:
-            if tag in message:
-                try:
-                    score_str = message.split(tag)[1].split(")")[0].split("]")[0].strip()
-                    latest_score[0] = float(score_str)
-                except Exception:
-                    pass
-
-    try:
-        client.listen_auth_status(on_status_changed)
-    except Exception:
-        pass
-
-    live_scores = []
-    for i in range(5):
-        latest_score[0] = None
-        res, dist, tier = client.authenticate(username, {})
-        score = latest_score[0] if latest_score[0] is not None else 0.95
-        live_scores.append(score)
-        print(f"  Live Check {i+1}/5: result={res:<10} dist={dist:.4f} spoof_confidence={score:.4f}")
-        time.sleep(1.0)
-
-    live_mean = sum(live_scores) / len(live_scores)
-    print(f"\n  Live Confidence Mean: {live_mean:.4f}")
-
-    print("\n[4/4] Photo Spoof Verification")
-    input("  --> Now hold a PHOTO in front of the camera and press ENTER to run 5 spoof checks... ")
-
-    photo_scores = []
-    for i in range(5):
-        latest_score[0] = None
-        res, dist, tier = client.authenticate(username, {})
-        score = latest_score[0] if latest_score[0] is not None else 0.50
-        photo_scores.append(score)
-        print(f"  Photo Check {i+1}/5: result={res:<10} dist={dist:.4f} spoof_confidence={score:.4f}")
-        time.sleep(1.0)
-
-    photo_mean = sum(photo_scores) / len(photo_scores)
-    gap = live_mean - photo_mean
-
-    print("\n=======================================================")
-    print("CALIBRATION SUMMARY RESULTS:")
-    print(f"  Live Face Confidence Mean  : {live_mean:.4f}")
-    print(f"  Photo Attack Confidence Mean: {photo_mean:.4f}")
-    print(f"  Confidence Gap             : {gap:.4f}")
-    print("=======================================================")
-
-    if gap < 0.15:
-        print("\nWARNING: MiniFASNet may not reliably distinguish live faces from photos on this camera.")
-        print("The system will rely primarily on distance thresholding for spoof protection.")
 
 def cmd_greeter_info(client: SentinelDBusClient, args):
     info = None
@@ -252,18 +167,16 @@ def main():
     # enroll
     p_enroll = subparsers.add_parser("enroll", help="Run interactive Face ID enrollment wizard")
     p_enroll.add_argument("username", nargs="?", default=None, help="Username to enroll (default: current user)")
-    p_enroll.add_argument("--glasses", action="store_true", help="Enroll with and without glasses (30 vectors)")
-    p_enroll.add_argument("--append-glasses", action="store_true", help="Append glasses-variant vectors to existing gallery")
+    p_glasses = p_enroll.add_mutually_exclusive_group()
+    p_glasses.add_argument("--glasses", dest="glasses", action="store_true", default=None,
+                           help="Enroll with and without glasses (30 vectors) without being asked")
+    p_glasses.add_argument("--no-glasses", dest="glasses", action="store_false",
+                           help="Enroll without the glasses pass (15 vectors) without being asked")
     p_enroll.set_defaults(func=cmd_enroll)
 
     # dashboard
     p_dash = subparsers.add_parser("dashboard", help="Launch Textual TUI dashboard")
     p_dash.set_defaults(func=cmd_dashboard)
-
-    # calibrate-spoof
-    p_calib = subparsers.add_parser("calibrate-spoof", help="Run interactive MiniFASNet anti-spoof calibration")
-    p_calib.add_argument("username", nargs="?", default=None, help="Username to test (default: current user)")
-    p_calib.set_defaults(func=cmd_calibrate_spoof)
 
     # greeter-info
     p_greeter = subparsers.add_parser("greeter-info", help="Inspect display manager and greeter integration status")

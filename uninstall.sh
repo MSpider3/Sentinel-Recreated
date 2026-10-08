@@ -58,6 +58,8 @@ systemctl reload dbus || true
 
 echo "[5/7] Uninstalling Python package..."
 pip3 uninstall -y sentinel-py sentinel &>/dev/null || true
+rm -rf /opt/sentinel
+rm -f /usr/local/bin/sentinel
 
 echo "[6/7] Removing cache models & config..."
 rm -rf /var/cache/sentinel

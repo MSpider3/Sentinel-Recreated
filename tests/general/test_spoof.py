@@ -50,19 +50,21 @@ def main():
     t1_results = []
     for i in range(5):
         print(f"  Attempt {i+1}/5 ...", end="", flush=True)
-        res, dist, tier = client.authenticate(username)
-        print(f" Result: {res:<10} | Distance: {dist:.4f} | Tier: {tier}")
-        t1_results.append((res, dist, tier))
+        t0 = time.time()
+        res, _, tier = client.authenticate(username)
+        scores = client.last_auth_scores(t0)
+        print(f" Result: {res:<12} | {scores} | Tier: {tier}")
+        t1_results.append((res, scores, tier))
         if i < 4:
             time.sleep(2.0)
 
-    t1_passed = sum(1 for res, dist, tier in t1_results if res in ("GRANTED", "REQUIRE_2FA"))
+    t1_passed = sum(1 for res, dist, tier in t1_results if res == "GRANTED")
     t1_pass = t1_passed == 5
 
     print(f"\nTest 1 Summary: {t1_passed}/5 live attempts succeeded. Result: {'PASS' if t1_pass else 'FAIL'}")
     report_lines.append("\n[Test 1: Live Face]")
-    for idx, (res, dist, tier) in enumerate(t1_results, 1):
-        report_lines.append(f"  Attempt {idx}: status={res:<10} dist={dist:.4f} tier={tier}")
+    for idx, (res, scores, tier) in enumerate(t1_results, 1):
+        report_lines.append(f"  Attempt {idx}: status={res:<12} {scores} tier={tier}")
     report_lines.append(f"  Live Pass Rate: {t1_passed}/5 | Result: {'PASS' if t1_pass else 'FAIL'}")
 
     # -------------------------------------------------------------------------
@@ -71,44 +73,48 @@ def main():
     print("\n--- Test 2: Photo Spoof Attack (5 Attempts) ---")
     print("Hold a PHOTO of yourself (printed photo or smartphone screen showing your face) in front of the camera.")
     print("NOTE ON REJECTION TYPES:")
-    print("  - SPOOF  : MiniFASNet anti-spoof model detected texture/flatness anomalies (explicit spoof alert)")
-    print("  - DENIED : Cosine distance > 0.50 (distance threshold rejection due to 2D image distortion)")
-    print("Both SPOOF and DENIED represent successful security rejections against photo attacks.\n")
+    print("  - SPOOF        : the face matched you, but the anti-spoof model saw a photo/screen")
+    print("  - DENIED       : the face did not match at all")
+    print("  - TIMEOUT      : no decision within the time limit")
+    print("  - RATE_LIMITED : too many failed attempts in a minute (face unlock paused)")
+    print("Anything except GRANTED is a successful rejection. For a real test the photo must be OF YOU.\n")
 
     input("Hold photo in front of camera and press ENTER to begin Test 2...")
 
     t2_results = []
     for i in range(5):
         print(f"  Attempt {i+1}/5 ...", end="", flush=True)
-        res, dist, tier = client.authenticate(username)
-        print(f" Result: {res:<10} | Distance: {dist:.4f} | Tier: {tier}")
-        t2_results.append((res, dist, tier))
+        t0 = time.time()
+        res, _, tier = client.authenticate(username)
+        scores = client.last_auth_scores(t0)
+        print(f" Result: {res:<12} | {scores} | Tier: {tier}")
+        t2_results.append((res, scores, tier))
         if i < 4:
             time.sleep(2.0)
 
     spoof_count = sum(1 for res, _, _ in t2_results if res == "SPOOF")
-    denied_count = sum(1 for res, _, _ in t2_results if res == "DENIED")
-    granted_count = sum(1 for res, _, _ in t2_results if res in ("GRANTED", "REQUIRE_2FA"))
+    granted_count = sum(1 for res, _, _ in t2_results if res == "GRANTED")
+    denied_count = len(t2_results) - spoof_count - granted_count
 
     total_rejected = spoof_count + denied_count
-    t2_pass = total_rejected >= 3
+    t2_pass = granted_count == 0
 
     print("\nTest 2 Breakdown:")
     print(f"  Explicit SPOOF rejections  : {spoof_count}")
-    print(f"  Distance DENIED rejections : {denied_count}")
+    print(f"  Other rejections           : {denied_count}")
     print(f"  Unwanted GRANTED matches   : {granted_count}")
     print(f"  Total Security Rejections  : {total_rejected}/5")
     print(f"Test 2 Result: {'PASS' if t2_pass else 'FAIL'}")
 
     report_lines.append("\n[Test 2: Photo Spoof Attack]")
-    for idx, (res, dist, tier) in enumerate(t2_results, 1):
-        report_lines.append(f"  Attempt {idx}: status={res:<10} dist={dist:.4f} tier={tier}")
+    for idx, (res, scores, tier) in enumerate(t2_results, 1):
+        report_lines.append(f"  Attempt {idx}: status={res:<12} {scores} tier={tier}")
     report_lines.append(f"  Explicit SPOOF Rejections  : {spoof_count}")
-    report_lines.append(f"  Distance DENIED Rejections : {denied_count}")
+    report_lines.append(f"  Other Rejections           : {denied_count}")
     report_lines.append(f"  Total Security Rejections  : {total_rejected}/5 | Result: {'PASS' if t2_pass else 'FAIL'}")
 
-    if spoof_count < 3 and total_rejected >= 3:
-        note = "Note: Spoof protection relied primarily on distance thresholding (DENIED). Consider tuning MiniFASNet calibration if higher explicit SPOOF rates are desired."
+    if spoof_count == 0 and granted_count == 0:
+        note = "Note: no explicit SPOOF result. If the photo was not recognised as you, the anti-spoof model was never tested — repeat with a clear photo or phone video of yourself."
         print(f"\n{note}")
         report_lines.append(f"  {note}")
 

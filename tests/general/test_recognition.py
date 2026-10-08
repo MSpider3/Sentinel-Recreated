@@ -18,17 +18,27 @@ def parse_args():
     parser.add_argument("--output-dir", type=str, default=None, help="Directory to save report output")
     return parser.parse_args()
 
+# NOTE: the daemon never returns the real match distance over DBus (it would
+# let a caller probe someone's face template). These tests judge by the result
+# string and tier, and show the real distance and anti-spoof score by reading
+# the audit log (SentinelDBusClient.last_auth_scores).
+
 def tier_to_str(tier_num: int) -> str:
-    mapping = {1: "Tier 1 (Golden)", 2: "Tier 2 (Standard)", 3: "Tier 3 (TwoFactor)", 4: "Tier 4 (Denied)"}
+    mapping = {0: "No face", 1: "Tier 1 (Golden)", 2: "Tier 2 (Standard)", 4: "Not granted"}
     return mapping.get(tier_num, f"Tier {tier_num}")
+
+def granted_count(results) -> int:
+    return sum(1 for res, _, _ in results if res == "GRANTED")
 
 def run_auth_attempts(client: SentinelDBusClient, username: str, count: int, sleep_sec: float = 2.0):
     results = []
     for i in range(count):
         print(f"  Attempt {i+1}/{count} ...", end="", flush=True)
-        res, dist, tier = client.authenticate(username)
-        print(f" Result: {res} | Distance: {dist:.4f} | {tier_to_str(tier)}")
-        results.append((res, dist, tier))
+        t0 = time.time()
+        res, _, tier = client.authenticate(username)
+        scores = client.last_auth_scores(t0)
+        print(f" Result: {res} | {scores} | {tier_to_str(tier)}")
+        results.append((res, scores, tier))
         if i < count - 1:
             time.sleep(sleep_sec)  # Inter-session cleanup delay
     return results
@@ -65,17 +75,16 @@ def main():
     input("Press ENTER to begin Test 1...")
 
     t1_results = run_auth_attempts(client, username, 10, sleep_sec=2.0)
-    t1_passes = sum(1 for res, dist, tier in t1_results if tier in (1, 2) and dist < 0.42)
-    t1_mean_d = sum(dist for _, dist, _ in t1_results) / len(t1_results)
+    t1_passes = granted_count(t1_results)
 
-    print(f"\nTest 1 Summary: {t1_passes}/10 attempts produced Tier 1 or Tier 2 (d < 0.42). Mean distance: {t1_mean_d:.4f}")
+    print(f"\nTest 1 Summary: {t1_passes}/10 attempts were GRANTED.")
     t1_pass = t1_passes >= 8
     print(f"Test 1 Status: {'PASS' if t1_pass else 'FAIL'}")
 
     report_lines.append("\n[Test 1: Self Recognition]")
-    for idx, (res, dist, tier) in enumerate(t1_results, 1):
-        report_lines.append(f"  Attempt {idx:2d}: status={res:<10} dist={dist:.4f} tier={tier_to_str(tier)}")
-    report_lines.append(f"  Pass Rate: {t1_passes}/10 in Tier 1/2 | Mean Distance: {t1_mean_d:.4f} | Result: {'PASS' if t1_pass else 'FAIL'}")
+    for idx, (res, scores, tier) in enumerate(t1_results, 1):
+        report_lines.append(f"  Attempt {idx:2d}: status={res:<10} {scores} tier={tier_to_str(tier)}")
+    report_lines.append(f"  Pass Rate: {t1_passes}/10 GRANTED | Result: {'PASS' if t1_pass else 'FAIL'}")
 
     # -------------------------------------------------------------------------
     # Test 2 — Distance sensitivity
@@ -83,43 +92,23 @@ def main():
     print("\n--- Test 2: Distance Sensitivity ---")
 
     input("Prompt 2.1: Sit at your NORMAL distance. Press ENTER when ready...")
-    t2_normal = run_auth_attempts(client, username, 5, sleep_sec=2.0)
-    mean_normal = sum(d for _, d, _ in t2_normal) / len(t2_normal)
+    t2_normal = granted_count(run_auth_attempts(client, username, 5, sleep_sec=2.0))
 
     input("Prompt 2.2: Move 30cm FURTHER BACK. Press ENTER when ready...")
-    t2_back = run_auth_attempts(client, username, 5, sleep_sec=2.0)
-    mean_back = sum(d for _, d, _ in t2_back) / len(t2_back)
+    t2_back = granted_count(run_auth_attempts(client, username, 5, sleep_sec=2.0))
 
     input("Prompt 2.3: Move 30cm CLOSER. Press ENTER when ready...")
-    t2_closer = run_auth_attempts(client, username, 5, sleep_sec=2.0)
-    mean_closer = sum(d for _, d, _ in t2_closer) / len(t2_closer)
+    t2_closer = granted_count(run_auth_attempts(client, username, 5, sleep_sec=2.0))
 
-    print("\nTest 2 Summary:")
-    print(f"  Normal position mean distance : {mean_normal:.4f}")
-    print(f"  +30cm further mean distance   : {mean_back:.4f}")
-    print(f"  -30cm closer mean distance    : {mean_closer:.4f}")
+    print("\nTest 2 Summary (GRANTED out of 5):")
+    print(f"  Normal position : {t2_normal}/5")
+    print(f"  +30cm further   : {t2_back}/5")
+    print(f"  -30cm closer    : {t2_closer}/5")
 
-    report_lines.append("\n[Test 2: Distance Sensitivity]")
-    report_lines.append(f"  Normal position mean distance : {mean_normal:.4f}")
-    report_lines.append(f"  +30cm further mean distance   : {mean_back:.4f}")
-    report_lines.append(f"  -30cm closer mean distance    : {mean_closer:.4f}")
-
-    # -------------------------------------------------------------------------
-    # Threshold Recommendations (from Observed Distances)
-    # -------------------------------------------------------------------------
-    rec_golden = max(0.15, round(mean_normal - 0.05, 3))
-    rec_standard = min(0.42, round(mean_normal + 0.05, 3))
-    print("\n----------------------------------------------------------")
-    print(f"[THRESHOLD CALIBRATION RECOMMENDATION]")
-    print(f"  Observed normal position mean distance: {mean_normal:.4f}")
-    print(f"  Recommended golden_threshold   : {rec_golden:.3f}")
-    print(f"  Recommended standard_threshold : {rec_standard:.3f}")
-    print("----------------------------------------------------------")
-
-    report_lines.append("\n[Threshold Recommendations]")
-    report_lines.append(f"  Observed mean distance at normal position: {mean_normal:.4f}")
-    report_lines.append(f"  Recommended golden_threshold   : {rec_golden:.3f}")
-    report_lines.append(f"  Recommended standard_threshold : {rec_standard:.3f}")
+    report_lines.append("\n[Test 2: Distance Sensitivity — GRANTED out of 5]")
+    report_lines.append(f"  Normal position : {t2_normal}/5")
+    report_lines.append(f"  +30cm further   : {t2_back}/5")
+    report_lines.append(f"  -30cm closer    : {t2_closer}/5")
 
     # -------------------------------------------------------------------------
     # Test 3 — Lighting variation
@@ -127,26 +116,23 @@ def main():
     print("\n--- Test 3: Lighting Variation ---")
 
     input("Prompt 3.1: NORMAL lighting. Press ENTER when ready...")
-    t3_normal = run_auth_attempts(client, username, 3, sleep_sec=2.0)
-    mean_l_normal = sum(d for _, d, _ in t3_normal) / len(t3_normal)
+    t3_normal = granted_count(run_auth_attempts(client, username, 3, sleep_sec=2.0))
 
     input("Prompt 3.2: Turn OFF overhead light (use screen light only). Press ENTER when ready...")
-    t3_dark = run_auth_attempts(client, username, 3, sleep_sec=2.0)
-    mean_l_dark = sum(d for _, d, _ in t3_dark) / len(t3_dark)
+    t3_dark = granted_count(run_auth_attempts(client, username, 3, sleep_sec=2.0))
 
     input("Prompt 3.3: Turn lights BACK ON. Press ENTER when ready...")
-    t3_restored = run_auth_attempts(client, username, 3, sleep_sec=2.0)
-    mean_l_restored = sum(d for _, d, _ in t3_restored) / len(t3_restored)
+    t3_restored = granted_count(run_auth_attempts(client, username, 3, sleep_sec=2.0))
 
-    print("\nTest 3 Summary:")
-    print(f"  Normal lighting mean distance  : {mean_l_normal:.4f}")
-    print(f"  Low/Screen light mean distance : {mean_l_dark:.4f}")
-    print(f"  Restored light mean distance   : {mean_l_restored:.4f}")
+    print("\nTest 3 Summary (GRANTED out of 3):")
+    print(f"  Normal lighting  : {t3_normal}/3")
+    print(f"  Low/Screen light : {t3_dark}/3")
+    print(f"  Restored light   : {t3_restored}/3")
 
-    report_lines.append("\n[Test 3: Lighting Variation]")
-    report_lines.append(f"  Normal light mean distance   : {mean_l_normal:.4f}")
-    report_lines.append(f"  Screen-only mean distance    : {mean_l_dark:.4f}")
-    report_lines.append(f"  Restored light mean distance : {mean_l_restored:.4f}")
+    report_lines.append("\n[Test 3: Lighting Variation — GRANTED out of 3]")
+    report_lines.append(f"  Normal light   : {t3_normal}/3")
+    report_lines.append(f"  Screen-only    : {t3_dark}/3")
+    report_lines.append(f"  Restored light : {t3_restored}/3")
 
     # -------------------------------------------------------------------------
     # Test 4 — Glasses cross-test
@@ -157,20 +143,18 @@ def main():
     t4_pass = True
     if do_glasses == 'y':
         input("Prompt 4.1: Put GLASSES ON. Press ENTER when ready...")
-        t4_on = run_auth_attempts(client, username, 3, sleep_sec=2.0)
-        mean_on = sum(d for _, d, _ in t4_on) / len(t4_on)
+        t4_on = granted_count(run_auth_attempts(client, username, 3, sleep_sec=2.0))
 
         input("Prompt 4.2: Take GLASSES OFF. Press ENTER when ready...")
-        t4_off = run_auth_attempts(client, username, 3, sleep_sec=2.0)
-        mean_off = sum(d for _, d, _ in t4_off) / len(t4_off)
+        t4_off = granted_count(run_auth_attempts(client, username, 3, sleep_sec=2.0))
 
-        t4_pass = all(d < 0.50 for _, d, _ in t4_on + t4_off)
-        print(f"\nTest 4 Summary: Glasses ON mean={mean_on:.4f} | Glasses OFF mean={mean_off:.4f} | Status: {'PASS' if t4_pass else 'FAIL'}")
+        t4_pass = t4_on >= 2 and t4_off >= 2
+        print(f"\nTest 4 Summary: Glasses ON {t4_on}/3 | Glasses OFF {t4_off}/3 | Status: {'PASS' if t4_pass else 'FAIL'}")
 
-        report_lines.append("\n[Test 4: Glasses Cross-Test]")
-        report_lines.append(f"  Glasses ON mean distance  : {mean_on:.4f}")
-        report_lines.append(f"  Glasses OFF mean distance : {mean_off:.4f}")
-        report_lines.append(f"  Result                    : {'PASS' if t4_pass else 'FAIL'}")
+        report_lines.append("\n[Test 4: Glasses Cross-Test — GRANTED out of 3]")
+        report_lines.append(f"  Glasses ON  : {t4_on}/3")
+        report_lines.append(f"  Glasses OFF : {t4_off}/3")
+        report_lines.append(f"  Result      : {'PASS' if t4_pass else 'FAIL'}")
     else:
         print("Skipping Test 4 (Glasses Cross-Test).")
         report_lines.append("\n[Test 4: Glasses Cross-Test]\n  SKIPPED")
@@ -181,21 +165,22 @@ def main():
     print("\n--- Test 5: False Acceptance Threshold ---")
     print("NOTE: Have a DIFFERENT person sit in front of the camera.")
     print("      (Alternative: If a second person is not available, point the camera at a photo of a completely different person).")
+    print("NOTE: after 5 failed attempts in a minute the daemon answers RATE_LIMITED for a while — that is expected.")
     input("Press ENTER when ready to run 5 false-acceptance attempts...")
 
     t5_results = run_auth_attempts(client, username, 5, sleep_sec=2.0)
-    t5_denied_count = sum(1 for res, dist, tier in t5_results if tier == 4 and dist > 0.50)
+    t5_denied_count = sum(1 for res, _, _ in t5_results if res != "GRANTED")
 
     t5_pass = t5_denied_count == 5
     if not t5_pass:
-        print("\n!!! SECURITY FAILURE: Non-enrolled face was NOT rejected as Tier 4 Denied !!!")
+        print("\n!!! SECURITY FAILURE: a non-enrolled face was GRANTED !!!")
     else:
-        print("\nTest 5 Summary: ALL 5/5 attempts correctly DENIED (d > 0.50). PASS!")
+        print("\nTest 5 Summary: ALL 5/5 attempts correctly refused. PASS!")
 
-    report_lines.append("\n[Test 5: False Acceptance Threshold]")
-    for idx, (res, dist, tier) in enumerate(t5_results, 1):
-        report_lines.append(f"  Attempt {idx}: status={res:<10} dist={dist:.4f} tier={tier_to_str(tier)}")
-    report_lines.append(f"  Denied Count: {t5_denied_count}/5 | Result: {'PASS' if t5_pass else 'SECURITY FAILURE'}")
+    report_lines.append("\n[Test 5: False Acceptance]")
+    for idx, (res, scores, tier) in enumerate(t5_results, 1):
+        report_lines.append(f"  Attempt {idx}: status={res:<12} {scores} tier={tier_to_str(tier)}")
+    report_lines.append(f"  Refused Count: {t5_denied_count}/5 | Result: {'PASS' if t5_pass else 'SECURITY FAILURE'}")
 
     # -------------------------------------------------------------------------
     today_str = datetime.now().strftime("%Y%m%d")

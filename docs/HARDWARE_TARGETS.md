@@ -31,7 +31,7 @@ The baseline hardware target represents a common consumer laptop or thin client 
 | **MiniFASNet Spoof Check** | **7.06 ms** mean (9.98 ms P95) | $< 10.0\text{ ms}$ | **PASS** |
 | **Total Pipeline (Mean)** | **33.31 ms** mean (~30 FPS) | $< 43.0\text{ ms}$ | **PASS** |
 | **Total Pipeline (P95)** | **74.49 ms** P95 | $< 100.0\text{ ms}$ | **PASS** |
-| **Daemon Cold-Start** | **35 ms** | $\le 5000\text{ ms}$ | **PASS** |
+| **Daemon start to ready (models loaded + warm-up runs)** | **~0.2–0.3 s** model loading on i3-1005G1 | $\le 5000\text{ ms}$ | **PASS** |
 
 > [!NOTE]
 > **Distance & Resolution Deployment Policy**:
@@ -41,12 +41,12 @@ The baseline hardware target represents a common consumer laptop or thin client 
 
 ## 3. Non-Negotiable Performance Rules
 
-1. **Default Model Selection**: `SCRFD-500M` and `MobileFaceNet` MUST be active by default. Heavy models (`SCRFD-10G` and `ArcFace ResNet50`) are opt-in configuration parameters only.
+1. **Default Model Selection**: `SCRFD-500M`, `MobileFaceNet` and `MiniFASNet` are the only supported models.
 2. **Idle Memory Ceiling**: When daemon is idle (models loaded into memory, no active authentication session), RSS memory usage MUST NOT exceed **400 MB**.
 3. **Thread-Isolated Capture**: Frame grabber executes in a dedicated high-priority thread. Frames are served asynchronously via ring buffer.
 4. **Stale Frame Eviction (200ms Rule)**: If pipeline processing of a single frame exceeds $200\text{ ms}$, the frame queue is flushed completely to ensure authentication evaluates real-time current state rather than backlogged frames.
-5. **Cold-Start Warmup Window**: First inference request after daemon boot may take up to $5.0\text{ s}$ for ONNX threadpool initialization. All subsequent auth cycles must complete within target latency budgets ($<100\text{ ms}$). *Note: Daemon cold-start boot-to-ready time MUST be explicitly benchmarked in Phase 8 of `DEVELOPMENT_PLAN.md` to ensure fast user switching scenarios meet performance requirements.*
-6. **Execution Provider Policy**: ONNX Runtime instances default to `CPUExecutionProvider` with single-thread optimization or OpenVINO execution if present, falling back gracefully without crash.
+5. **Models Stay Loaded**: all models are loaded once when the daemon starts, each followed by a dummy run, before the DBus name is claimed. No login pays for model loading or a first-inference warm-up.
+6. **Execution Provider Policy**: CPU only. All models share one ONNX Runtime thread pool of `onnx_num_threads` threads (use the physical core count); its threads do not spin while idle, so the daemon uses no CPU between scans.
 
 ---
 
@@ -63,8 +63,5 @@ The baseline hardware target represents a common consumer laptop or thin client 
 
 ```toml
 [hardware]
-execution_provider = "cpu"    # "cpu", "openvino" (recommended on Intel iGPU), or "cuda"
-onnx_num_threads = 2
-frame_drop_threshold_ms = 200
-max_daemon_memory_mb = 400
+onnx_num_threads = 2    # physical CPU cores
 ```
