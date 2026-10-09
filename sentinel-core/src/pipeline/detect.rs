@@ -1,7 +1,14 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use image::{imageops, RgbImage};
-use ort::execution_providers::{CPUExecutionProvider, OpenVINOExecutionProvider};
 use ort::{session::Session, value::Tensor};
+
+use crate::config::DetectionConfig;
+
+/// Frames with a mean pixel value below this get brightened for detection.
+const DARK_FRAME_MEAN: f32 = 90.0;
+/// Mean pixel value a dark frame is brightened to.
+const BRIGHTEN_TO_MEAN: f32 = 110.0;
+const MAX_BRIGHTEN_GAIN: f32 = 3.0;
 
 #[derive(Debug, Clone)]
 pub struct FaceDetection {
@@ -54,13 +61,6 @@ impl ScrfdDetector {
     ) -> Result<Self> {
         let session = Session::builder()
             .map_err(|e| anyhow::anyhow!("{:?}", e))?
-            .with_execution_providers([
-                OpenVINOExecutionProvider::default().build(),
-                CPUExecutionProvider::default().build(),
-            ])
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?
-            .with_intra_threads(2)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?
             .commit_from_file(model_path)
             .with_context(|| format!("Failed to load SCRFD model from: {}", model_path))?;
 
@@ -72,13 +72,31 @@ impl ScrfdDetector {
             score_threshold,
             nms_threshold,
             min_face_size_px,
-            input_size: input_size.max(160),
+            input_size: Self::valid_input_size(input_size),
         })
     }
 
+    /// SCRFD strides go up to 32, so the input side must be a multiple of 32.
+    fn valid_input_size(input_size: u32) -> u32 {
+        (input_size.clamp(160, 1280) / 32) * 32
+    }
+
+    /// Apply detection settings from the config (the session itself is reused).
+    pub fn configure(&mut self, config: &DetectionConfig) {
+        self.score_threshold = config.score_threshold;
+        self.nms_threshold = config.nms_threshold;
+        self.min_face_size_px = config.min_face_size_px;
+        self.input_size = Self::valid_input_size(config.scrfd_input_size);
+    }
+
     pub fn detect(&mut self, frame: &RgbImage) -> Result<Vec<FaceDetection>> {
-        let res = self.detect_detailed(frame)?;
-        Ok(res.detections)
+        Ok(self.run(frame, false)?.detections)
+    }
+
+    /// Like `detect`, but also returns every raw candidate with the reason it
+    /// was filtered. Diagnostics only — not for the authentication hot path.
+    pub fn detect_detailed(&mut self, frame: &RgbImage) -> Result<ScrfdResult> {
+        self.run(frame, true)
     }
 
     pub fn is_valid_frame_size(width: u32, height: u32) -> bool {
@@ -86,7 +104,7 @@ impl ScrfdDetector {
         width >= 1 && height >= 1 && width <= MAX_DIM && height <= MAX_DIM
     }
 
-    pub fn detect_detailed(&mut self, frame: &RgbImage) -> Result<ScrfdResult> {
+    fn run(&mut self, frame: &RgbImage, collect_raw: bool) -> Result<ScrfdResult> {
         let orig_width = frame.width() as f32;
         let orig_height = frame.height() as f32;
 
@@ -112,23 +130,39 @@ impl ScrfdDetector {
         let input_size_f = self.input_size as f32;
         let input_size_u = self.input_size as u32;
 
-        let scale_x = input_size_f / orig_width;
-        let scale_y = input_size_f / orig_height;
+        // Letterbox: shrink keeping the aspect ratio, place top-left, pad the
+        // rest with black. SCRFD is trained this way; stretching a 4:3 frame
+        // into a square distorts the face and its landmarks.
+        let scale = input_size_f / orig_width.max(orig_height);
+        let new_w = ((orig_width * scale).round() as u32).clamp(1, input_size_u);
+        let new_h = ((orig_height * scale).round() as u32).clamp(1, input_size_u);
 
-        let resized = imageops::resize(frame, input_size_u, input_size_u, imageops::FilterType::Triangle);
+        let resized = imageops::resize(frame, new_w, new_h, imageops::FilterType::Triangle);
         let raw_pixels = resized.as_raw();
 
+        // In a dim room the detector misses faces it finds easily once the
+        // picture is brightened. The gain is applied to the detector's copy
+        // only; recognition and anti-spoof always see the untouched frame.
+        let mean = raw_pixels.iter().map(|&v| v as u64).sum::<u64>() as f32 / raw_pixels.len().max(1) as f32;
+        let gain = if mean < DARK_FRAME_MEAN {
+            (BRIGHTEN_TO_MEAN / mean.max(1.0)).min(MAX_BRIGHTEN_GAIN)
+        } else {
+            1.0
+        };
+
         let plane_size = (input_size_u * input_size_u) as usize;
-        let mut flat = vec![0.0f32; 3 * plane_size];
+        let black = -127.5 / 128.0;
+        let mut flat = vec![black; 3 * plane_size];
 
-        for i in 0..plane_size {
-            let r = raw_pixels[i * 3] as f32;
-            let g = raw_pixels[i * 3 + 1] as f32;
-            let b = raw_pixels[i * 3 + 2] as f32;
-
-            flat[i] = (r - 127.5) / 128.0;
-            flat[plane_size + i] = (g - 127.5) / 128.0;
-            flat[plane_size * 2 + i] = (b - 127.5) / 128.0;
+        for y in 0..new_h as usize {
+            for x in 0..new_w as usize {
+                let src = (y * new_w as usize + x) * 3;
+                let dst = y * input_size_u as usize + x;
+                for ch in 0..3 {
+                    let value = (raw_pixels[src + ch] as f32 * gain).min(255.0);
+                    flat[plane_size * ch + dst] = (value - 127.5) / 128.0;
+                }
+            }
         }
 
         let input_tensor = Tensor::<f32>::from_array((
@@ -170,6 +204,19 @@ impl ScrfdDetector {
                 let feat_w = (self.input_size / stride) as usize;
                 let num_anchors = 2usize;
 
+                let cells = feat_h * feat_w * num_anchors;
+                if score_slice.len() != cells
+                    || bbox_slice.len() != cells * 4
+                    || kps_slice.len() != cells * 10
+                {
+                    bail!(
+                        "Unexpected SCRFD output size at stride {} (got {} scores, expected {})",
+                        stride,
+                        score_slice.len(),
+                        cells
+                    );
+                }
+
                 for r in 0..feat_h {
                     for c in 0..feat_w {
                         for a in 0..num_anchors {
@@ -186,10 +233,10 @@ impl ScrfdDetector {
                                 let dx2 = bbox_slice[b_idx + 2] * (stride as f32);
                                 let dy2 = bbox_slice[b_idx + 3] * (stride as f32);
 
-                                let x1 = (cx - dx1) / scale_x;
-                                let y1 = (cy - dy1) / scale_y;
-                                let x2 = (cx + dx2) / scale_x;
-                                let y2 = (cy + dy2) / scale_y;
+                                let x1 = (cx - dx1) / scale;
+                                let y1 = (cy - dy1) / scale;
+                                let x2 = (cx + dx2) / scale;
+                                let y2 = (cy + dy2) / scale;
 
                                 let bw = (x2 - x1).max(0.0);
                                 let bh = (y2 - y1).max(0.0);
@@ -197,30 +244,35 @@ impl ScrfdDetector {
                                 let k_idx = idx * 10;
                                 let mut landmarks = [[0.0f32; 2]; 5];
                                 for k in 0..5 {
-                                    let kx = (cx + kps_slice[k_idx + k * 2] * (stride as f32)) / scale_x;
-                                    let ky = (cy + kps_slice[k_idx + k * 2 + 1] * (stride as f32)) / scale_y;
+                                    let kx = (cx + kps_slice[k_idx + k * 2] * (stride as f32)) / scale;
+                                    let ky = (cy + kps_slice[k_idx + k * 2 + 1] * (stride as f32)) / scale;
                                     landmarks[k] = [kx, ky];
                                 }
 
-                                let filter_reason = if score < self.score_threshold {
-                                    Some(format!("score below {:.2} threshold", self.score_threshold))
-                                } else if bw < (self.min_face_size_px as f32) || bh < (self.min_face_size_px as f32) {
-                                    let min_dim = bw.min(bh);
-                                    Some(format!("face detected but too small (bbox={:.0}px, min={}px)", min_dim, self.min_face_size_px))
-                                } else {
-                                    None
-                                };
+                                let low_score = score < self.score_threshold;
+                                let too_small = bw < (self.min_face_size_px as f32)
+                                    || bh < (self.min_face_size_px as f32);
 
-                                raw_candidates.push(RawCandidate {
-                                    bbox: [x1, y1, x2, y2],
-                                    landmarks,
-                                    score,
-                                    bw,
-                                    bh,
-                                    filter_reason: filter_reason.clone(),
-                                });
+                                if collect_raw {
+                                    let filter_reason = if low_score {
+                                        Some(format!("score below {:.2} threshold", self.score_threshold))
+                                    } else if too_small {
+                                        let min_dim = bw.min(bh);
+                                        Some(format!("face detected but too small (bbox={:.0}px, min={}px)", min_dim, self.min_face_size_px))
+                                    } else {
+                                        None
+                                    };
+                                    raw_candidates.push(RawCandidate {
+                                        bbox: [x1, y1, x2, y2],
+                                        landmarks,
+                                        score,
+                                        bw,
+                                        bh,
+                                        filter_reason,
+                                    });
+                                }
 
-                                if filter_reason.is_none() {
+                                if !low_score && !too_small {
                                     valid_candidates.push(FaceDetection {
                                         bbox: [x1, y1, x2, y2],
                                         landmarks,
@@ -236,29 +288,8 @@ impl ScrfdDetector {
 
         drop(outputs);
 
-        let mut sorted_raw = raw_candidates.clone();
+        let mut sorted_raw = raw_candidates;
         sorted_raw.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-
-        if sorted_raw.is_empty() {
-            println!("[SCRFD] Raw detections: 0 faces found");
-        } else {
-            let top = &sorted_raw[0];
-            let x = top.bbox[0] as i32;
-            let y = top.bbox[1] as i32;
-            let w = top.bw as i32;
-            let h = top.bh as i32;
-            if let Some(ref reason) = top.filter_reason {
-                println!(
-                    "[SCRFD] Raw detections: 1 face (score={:.2}, bbox=[x={},y={},w={},h={}]) — FILTERED: {}",
-                    top.score, x, y, w, h, reason
-                );
-            } else {
-                println!(
-                    "[SCRFD] Raw detections: 1 face (score={:.2}, bbox=[x={},y={},w={},h={}]) — PASSED",
-                    top.score, x, y, w, h
-                );
-            }
-        }
 
         let nms_results = self.apply_nms(valid_candidates);
         Ok(ScrfdResult {

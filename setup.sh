@@ -11,9 +11,32 @@ set -e
 
 # ---- Flag parsing ------------------------------------------
 DRY_RUN=0
+ASSUME_YES=0
 for arg in "$@"; do
     [ "$arg" = "--dry-run" ] && DRY_RUN=1
+    [ "$arg" = "--yes" ] && ASSUME_YES=1
 done
+
+# Ask a yes/no question. $2 is the answer used when the user just presses
+# Enter ("y" or "n"). --yes answers yes to everything.
+ask() {
+    [ "$ASSUME_YES" -eq 1 ] && return 0
+    local reply="" default="${2:-n}" hint="[y/N]"
+    [ "$default" = "y" ] && hint="[Y/n]"
+    read -r -p "$1 $hint " reply || true
+    case "${reply:-$default}" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+}
+
+# Build steps run as the user who called sudo, not as root: root often has no
+# Rust toolchain on its PATH and would leave root-owned files in the checkout.
+BUILD_USER="${SUDO_USER:-root}"
+as_builder() {
+    if [ "$BUILD_USER" = "root" ]; then
+        bash -lc "$1"
+    else
+        sudo -u "$BUILD_USER" -H bash -lc "cd '$PWD' && $1"
+    fi
+}
 
 if [ "$DRY_RUN" -eq 1 ]; then
     echo "=== Sentinel Face ID Setup (DRY RUN — no files will be modified) ==="
@@ -23,7 +46,7 @@ fi
 
 # ---- Preflight check ---------------------------------------
 if [ "$EUID" -ne 0 ]; then
-    echo "Error: Must be run as root. Usage: sudo ./setup.sh [--dry-run]"
+    echo "Error: Must be run as root. Usage: sudo ./setup.sh [--dry-run] [--yes]"
     exit 1
 fi
 
@@ -50,7 +73,7 @@ detect_display_manager() {
     # Primary: check active systemd services
     local DM_SERVICE
     DM_SERVICE=$(systemctl list-units --type=service --state=active 2>/dev/null | \
-        grep -E "gdm\.service|sddm\.service|greetd\.service|lightdm\.service|ly\.service" | \
+        grep -E "(^|[[:space:]])(gdm|sddm|greetd|lightdm|ly)\.service" | \
         awk '{print $1}' | head -1)
 
     case "$DM_SERVICE" in
@@ -136,24 +159,24 @@ install_system_deps() {
                 gstreamer1-devel gstreamer1-plugins-base-devel \
                 gstreamer1-plugins-good pipewire-gstreamer \
                 pam-devel dbus-devel meson ninja-build pkg-config \
-                opencv-devel wget unzip
+                python3-dbus python3-gobject wget unzip
             ;;
         ubuntu|debian|linuxmint|pop)
             apt-get install -y \
                 libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
                 gstreamer1.0-plugins-good gstreamer1.0-pipewire \
                 libpam0g-dev libdbus-1-dev meson ninja-build pkg-config \
-                libopencv-dev wget unzip
+                python3-dbus python3-gi python3-venv wget unzip
             ;;
         arch|manjaro|endeavouros)
             pacman -S --noconfirm \
                 gstreamer gst-plugins-base gst-plugins-good \
                 pam dbus meson ninja pkg-config \
-                opencv wget unzip
+                python-dbus python-gobject wget unzip
             ;;
         *)
             echo "WARNING: Unknown distro '$DISTRO_ID'."
-            echo "Install manually: gstreamer, pam-devel, dbus-devel, meson, ninja, opencv"
+            echo "Install manually: gstreamer, pam-devel, dbus-devel, meson, ninja, python3-dbus, python3-gobject"
             ;;
     esac
 }
@@ -207,7 +230,37 @@ inject_pam_line() {
 
     cp "$PAM_FILE" "${PAM_FILE}.bak.$(date +%Y%m%d)"
     sed -i "0,/^auth/s//auth       sufficient    pam_sentinel.so\nauth/" "$PAM_FILE"
-    echo "  Configured: $PAM_FILE"
+    if grep -q "pam_sentinel" "$PAM_FILE"; then
+        echo "  Configured: $PAM_FILE"
+    else
+        echo "  WARNING: $PAM_FILE has no line starting with 'auth' — left unchanged."
+        echo "  Add this line by hand above its auth lines:  $SENTINEL_LINE"
+    fi
+}
+
+# Remove the sentinel line from a PAM file (keeps a backup). Used when the
+# user says no to a service that an earlier run had enabled.
+remove_pam_line() {
+    local PAM_FILE="$1"
+    [ -f "$PAM_FILE" ] && grep -q "pam_sentinel" "$PAM_FILE" || return 0
+    cp "$PAM_FILE" "${PAM_FILE}.bak.$(date +%Y%m%d)"
+    sed -i '/pam_sentinel\.so/d' "$PAM_FILE"
+    echo "  Removed face unlock from: $PAM_FILE"
+}
+
+# Decide whether a service should use face unlock. If it already does, the
+# question is whether to keep it (default yes); otherwise whether to turn it
+# on (default no). $1 = what to call it, remaining args = its PAM files.
+wants_face_unlock() {
+    local label="$1"; shift
+    local f
+    for f in "$@"; do
+        if [ -f "$f" ] && grep -q "pam_sentinel" "$f"; then
+            ask "Face unlock is already on for $label. Keep it?" y
+            return
+        fi
+    done
+    ask "Use face unlock for $label?" n
 }
 
 # Create a minimal PAM file (Wayland lock screens that ship without one)
@@ -269,29 +322,39 @@ configure_pam() {
         echo ""
     fi
 
-    # Always configure sudo
-    inject_pam_line "/etc/pam.d/sudo"
-
-    # Display manager PAM files
+    # Face recognition with a normal webcam is a convenience, not a strong
+    # lock: a good photo or video of you may pass. The lock screen is always
+    # set up; sudo and the login screen are your choice.
+    local LOGIN_FILES=()
     case "$DM" in
-        gdm)
-            # gdm-password covers both login and GNOME lock screen — no separate lock screen file needed
-            inject_pam_line "/etc/pam.d/gdm-password"
-            inject_pam_line "/etc/pam.d/gdm-autologin"
-            ;;
-        sddm)
-            inject_pam_line "/etc/pam.d/sddm"
-            ;;
-        greetd)
-            inject_pam_line "/etc/pam.d/greetd"
-            ;;
-        lightdm)
-            inject_pam_line "/etc/pam.d/lightdm"
-            ;;
-        "")
-            echo "  WARNING: Could not detect display manager. Login screen PAM not configured."
-            ;;
+        gdm)     LOGIN_FILES=("/etc/pam.d/gdm-password") ;;
+        sddm)    LOGIN_FILES=("/etc/pam.d/sddm") ;;
+        greetd)  LOGIN_FILES=("/etc/pam.d/greetd") ;;
+        lightdm) LOGIN_FILES=("/etc/pam.d/lightdm") ;;
     esac
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "  [dry-run] Would ask whether to use face unlock for sudo (/etc/pam.d/sudo)"
+        echo "  [dry-run] and for the login screen (${LOGIN_FILES[*]:-not detected})."
+    else
+        if wants_face_unlock "sudo (root commands)" "/etc/pam.d/sudo"; then
+            inject_pam_line "/etc/pam.d/sudo"
+        else
+            remove_pam_line "/etc/pam.d/sudo"
+            echo "  sudo: face unlock off."
+        fi
+
+        if [ "${#LOGIN_FILES[@]}" -eq 0 ]; then
+            echo "  WARNING: Could not detect display manager. Login screen PAM not configured."
+        elif wants_face_unlock "the login screen ($DM)" "${LOGIN_FILES[@]}"; then
+            for f in "${LOGIN_FILES[@]}"; do inject_pam_line "$f"; done
+        else
+            for f in "${LOGIN_FILES[@]}"; do remove_pam_line "$f"; done
+            echo "  Login screen: face unlock off."
+            # On GNOME the lock screen uses the same PAM file as the login screen.
+            [ "$DM" = "gdm" ] && echo "  NOTE: the GNOME lock screen shares gdm-password, so it is off as well."
+        fi
+    fi
 
     # Lock screen PAM files (skipped for GNOME — handled via gdm-password above)
     case "$LOCK_SCREEN" in
@@ -356,8 +419,8 @@ fi
 # [1/10] System dependencies
 install_system_deps
 
-command -v cargo &>/dev/null || { echo "Error: Rust toolchain (cargo) not found. Install from https://rustup.rs"; exit 1; }
-python3 -c "import sys; assert sys.version_info >= (3,10)" || { echo "Error: Python 3.10+ required"; exit 1; }
+as_builder "command -v cargo" &>/dev/null || { echo "Error: Rust toolchain (cargo) not found for user '$BUILD_USER'. Install from https://rustup.rs"; exit 1; }
+python3 -c "import sys; assert sys.version_info >= (3,11)" || { echo "Error: Python 3.11+ required"; exit 1; }
 
 # [2/10] Download ONNX models (skip if present and non-zero)
 echo "[2/10] Checking ONNX models..."
@@ -371,6 +434,20 @@ download_if_missing() {
     wget -q --show-progress -O "$path" "$url" || { echo "FAILED: $url"; exit 1; }
 }
 
+# The daemon runs these files as root, so each one must be exactly the file
+# this release was tested with.
+verify_model() {
+    local path="$1" expected="$2" actual
+    actual=$(sha256sum "$path" | awk '{print $1}')
+    if [ "$actual" != "$expected" ]; then
+        echo "ERROR: checksum mismatch for $path"
+        echo "  expected $expected"
+        echo "  got      $actual"
+        echo "Delete the file and run setup again. If it still fails, do not use it."
+        exit 1
+    fi
+}
+
 if [ ! -s "$MODEL_DIR/scrfd_500m_kps.onnx" ] || [ ! -s "$MODEL_DIR/mobile_facenet.onnx" ]; then
     TMP=$(mktemp -d)
     download_if_missing "$TMP/buffalo_sc.zip" \
@@ -381,34 +458,45 @@ if [ ! -s "$MODEL_DIR/scrfd_500m_kps.onnx" ] || [ ! -s "$MODEL_DIR/mobile_facene
     rm -rf "$TMP"
 fi
 
+# Anti-spoof: two models that look at the face at different zoom levels.
 download_if_missing "$MODEL_DIR/MiniFASNetV2.onnx" \
     "https://github.com/yakhyo/face-anti-spoofing/releases/download/weights/MiniFASNetV2.onnx"
+download_if_missing "$MODEL_DIR/MiniFASNetV1SE.onnx" \
+    "https://github.com/yakhyo/face-anti-spoofing/releases/download/weights/MiniFASNetV1SE.onnx"
+
+verify_model "$MODEL_DIR/scrfd_500m_kps.onnx" "5e4447f50245bbd7966bd6c0fa52938c61474a04ec7def48753668a9d8b4ea3a"
+verify_model "$MODEL_DIR/mobile_facenet.onnx" "9cc6e4a75f0e2bf0b1aed94578f144d15175f357bdc05e815e5c4a02b319eb4f"
+verify_model "$MODEL_DIR/MiniFASNetV2.onnx"   "b32929adc2d9c34b9486f8c4c7bc97c1b69bc0ea9befefc380e4faae4e463907"
+verify_model "$MODEL_DIR/MiniFASNetV1SE.onnx" "ebab7f90c7833fbccd46d3a555410e78d969db5438e169b6524be444862b3676"
 
 chmod 644 "$MODEL_DIR"/*.onnx
 echo "Models ready."
 
 # [3/10] Build Rust daemon
 echo "[3/10] Building Rust daemon..."
-cargo build --release --package sentinel-core
+as_builder "cargo build --release --package sentinel-core"
 install -m 755 target/release/sentinel-core /usr/local/bin/sentinel-daemon
 echo "Daemon installed."
 
 # [4/10] Build C PAM module
 echo "[4/10] Building C PAM module..."
-cd pam-sentinel
-meson setup build --wipe 2>/dev/null || meson setup build
-ninja -C build
-cd ..
+as_builder "cd pam-sentinel && (meson setup build --wipe 2>/dev/null || meson setup build) && ninja -C build"
 install_pam_module
 echo "PAM module installed."
 
 # [5/10] Install Python CLI
 echo "[5/10] Installing Python CLI..."
-pip3 install --quiet textual
-pip3 install --quiet -e .
-if [ -f /usr/local/sbin/sentinel ] && [ ! /usr/local/sbin/sentinel -ef /usr/local/bin/sentinel ]; then
-    ln -sf /usr/local/sbin/sentinel /usr/local/bin/sentinel || true
-fi
+# Own virtual environment: no pip changes to the system Python, and no link
+# back to this source folder. dbus and GLib bindings come from distro packages.
+VENV="/opt/sentinel/venv"
+python3 -m venv --system-site-packages "$VENV"
+"$VENV/bin/pip" install --quiet opencv-python numpy textual
+# Build from a copy so pip leaves no root-owned build files in this folder.
+PY_SRC=$(mktemp -d)
+cp -r pyproject.toml README.md sentinel_py "$PY_SRC/"
+"$VENV/bin/pip" install --quiet --no-deps "$PY_SRC"
+rm -rf "$PY_SRC"
+ln -sf "$VENV/bin/sentinel" /usr/local/bin/sentinel
 echo "CLI installed in /usr/local/bin/sentinel."
 
 # [6/10] Create system directories
@@ -464,7 +552,7 @@ echo "=== Sentinel Face ID Installation Complete ==="
 echo "  Distro      : $DISTRO_ID $DISTRO_VERSION"
 echo "  Disp. Manager: ${DM:-unknown}"
 echo "  Lock Screen : ${LOCK_SCREEN:-unknown}"
-echo "  Models      : $(ls /var/cache/sentinel/models/*.onnx 2>/dev/null | wc -l)/3 present"
+echo "  Models      : $(ls /var/cache/sentinel/models/*.onnx 2>/dev/null | wc -l)/4 present"
 echo "  Daemon      : $(systemctl is-active sentinel)"
 echo "  PAM (sudo)  : $(grep -c pam_sentinel /etc/pam.d/sudo 2>/dev/null || echo 0) line(s) in /etc/pam.d/sudo"
 echo "  CLI         : $(command -v sentinel && sentinel --version 2>/dev/null || echo 'not found')"

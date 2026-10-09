@@ -51,7 +51,7 @@ pub fn get_similarity_transform(
     }
 
     let a = sxy_00 + sxy_11;
-    let b = sxy_10 - sxy_01;
+    let b = sxy_01 - sxy_10;
     let scale = (a * a + b * b).sqrt() / src_var;
     let angle = b.atan2(a);
 
@@ -155,6 +155,24 @@ mod tests {
         assert!((m[1][0] - 0.0).abs() < 1e-4);
         assert!((m[1][1] - 1.0).abs() < 1e-4);
         assert!((m[1][2] - 0.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_alignment_undoes_head_roll() {
+        // A face rolled 20 degrees, twice canonical size, somewhere mid-frame:
+        // the transform must map its landmarks back onto the canonical ones.
+        let (sin, cos) = 20f32.to_radians().sin_cos();
+        let mut tilted = [[0.0f32; 2]; 5];
+        for (i, p) in CANONICAL_LANDMARKS.iter().enumerate() {
+            let (x, y) = (p[0] - 56.0, p[1] - 72.0);
+            tilted[i] = [2.0 * (cos * x - sin * y) + 320.0, 2.0 * (sin * x + cos * y) + 240.0];
+        }
+        let m = get_similarity_transform(&tilted, &CANONICAL_LANDMARKS).unwrap();
+        for (src, dst) in tilted.iter().zip(CANONICAL_LANDMARKS.iter()) {
+            let x = m[0][0] * src[0] as f64 + m[0][1] * src[1] as f64 + m[0][2];
+            let y = m[1][0] * src[0] as f64 + m[1][1] * src[1] as f64 + m[1][2];
+            assert!((x - dst[0] as f64).abs() < 0.01 && (y - dst[1] as f64).abs() < 0.01);
+        }
     }
 
     #[test]

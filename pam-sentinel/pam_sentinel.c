@@ -1,6 +1,6 @@
 /* pam_sentinel.c — Sentinel Recreated PAM bridge.
  * Zero biometric logic. Calls com.sentinel.Sentinel.Authenticate via libdbus-1.
- * Spec: docs/PAM_INTEGRATION.md  Constraint: < 200 lines C99. */
+ * Spec: docs/PAM_INTEGRATION.md  Kept deliberately small, C99. */
 
 #include <stdlib.h>
 #include <string.h>
@@ -13,7 +13,20 @@
 #define SENTINEL_BUS  "com.sentinel.Sentinel"
 #define SENTINEL_PATH "/com/sentinel/Sentinel"
 #define SENTINEL_IFACE "com.sentinel.Sentinel"
-#define SENTINEL_DBUS_TIMEOUT_MS 5000
+/* The daemon gives up a face scan after at most 7 s (MAX_SESSION_TIMEOUT_SECS
+ * in sentinel-core/src/config.rs). Wait a little longer than that, so the
+ * daemon always answers first and never keeps scanning for a caller that left. */
+#define SENTINEL_DBUS_TIMEOUT_MS 8000
+
+/* Overwrite a typed password before its memory is released. The volatile
+ * pointer stops the compiler from optimising the wipe away. */
+static void wipe_and_free(char *secret)
+{
+    if (!secret) return;
+    volatile char *p = secret;
+    while (*p) *p++ = '\0';
+    free(secret);
+}
 
 static int sentinel_reachable(DBusConnection *c)
 {
@@ -36,13 +49,14 @@ static int sentinel_reachable(DBusConnection *c)
     return (int)has;
 }
 
-static const char *sentinel_call(DBusConnection *c, const char *user,
-                                  const char *ssh_client, const char *ssh_tty)
+/* Ask the daemon to authenticate `user`. Returns 1 only if it answered
+ * "GRANTED"; 0 for every other answer and for any DBus failure. */
+static int sentinel_granted(DBusConnection *c, const char *user,
+                            const char *ssh_client, const char *ssh_tty)
 {
-    static char buf[64];
     DBusMessage *m = dbus_message_new_method_call(
         SENTINEL_BUS, SENTINEL_PATH, SENTINEL_IFACE, "Authenticate");
-    if (!m) return NULL;
+    if (!m) return 0;
 
     DBusMessageIter it, arr;
     dbus_message_iter_init_append(m, &it);
@@ -77,24 +91,21 @@ static const char *sentinel_call(DBusConnection *c, const char *user,
     DBusMessage *r = dbus_connection_send_with_reply_and_block(
                          c, m, SENTINEL_DBUS_TIMEOUT_MS, &e);
     dbus_message_unref(m);
-    if (dbus_error_is_set(&e) || !r) { dbus_error_free(&e); return NULL; }
+    if (dbus_error_is_set(&e) || !r) { dbus_error_free(&e); return 0; }
 
+    int granted = 0;
     const char *res = NULL;
     DBusMessageIter out;
-    dbus_message_iter_init(r, &out);
-    if (dbus_message_iter_get_arg_type(&out) == DBUS_TYPE_STRING) {
+    if (dbus_message_iter_init(r, &out)
+        && dbus_message_iter_get_arg_type(&out) == DBUS_TYPE_STRING) {
         dbus_message_iter_get_basic(&out, &res);
-        if (res) {
-            strncpy(buf, res, sizeof(buf) - 1);
-            buf[sizeof(buf) - 1] = '\0';
-            res = buf;
-        }
+        granted = (res != NULL && strcmp(res, "GRANTED") == 0);
     }
     dbus_message_unref(r); dbus_error_free(&e);
-    return res;
+    return granted;
 
 fail:
-    dbus_message_unref(m); return NULL;
+    dbus_message_unref(m); return 0;
 }
 
 PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
@@ -133,16 +144,16 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
     struct pam_response *cresp = NULL;
     int crc = conv->conv(1, &cmsgp, &cresp, conv->appdata_ptr);
     if (crc != PAM_SUCCESS) {
-        if (cresp) { free(cresp->resp); free(cresp); }
+        if (cresp) { wipe_and_free(cresp->resp); free(cresp); }
         return PAM_IGNORE; /* non-interactive caller or cancelled: never lock out */
     }
     if (cresp && cresp->resp && cresp->resp[0] != '\0') {
         /* User typed a password rather than empty Enter — pass it forward to pam_unix */
         pam_set_item(pamh, PAM_AUTHTOK, cresp->resp);
-        free(cresp->resp); free(cresp);
+        wipe_and_free(cresp->resp); free(cresp);
         return PAM_IGNORE;
     }
-    if (cresp) { free(cresp->resp); free(cresp); }
+    if (cresp) { wipe_and_free(cresp->resp); free(cresp); }
 
     /* 1. Get username — use exactly what PAM (greetd) reports; do NOT
      *    override with getuid() which returns root when greetd calls us. */
@@ -168,19 +179,15 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
     const char *ssh_t = getenv("SSH_TTY");
 
     /* 5. Call Authenticate(username, session_env) */
-    const char *result = sentinel_call(conn, user, ssh_c, ssh_t);
+    int granted = sentinel_granted(conn, user, ssh_c, ssh_t);
     dbus_connection_close(conn); dbus_connection_unref(conn);
 
-    /* 6. DBus RPC failed / daemon returned no payload → transparent fallback.
-     *    This is an infrastructure failure, not a recognition decision, so we
-     *    step aside and let pam_unix.so prompt for a password silently. */
-    if (!result) return PAM_IGNORE;
-
-    /* 7. Map daemon result string → PAM return code.
+    /* 6. Map the daemon's answer → PAM return code. A failed DBus call or an
+     *    empty reply counts as "not granted".
      *
      * FAIL-SAFE GUARANTEE:
      * Only an explicit "GRANTED" recognition result satisfies PAM with PAM_SUCCESS.
-     * Every other outcome ("NO_FACE", "TIMEOUT", "DENIED", "SPOOF", "REQUIRE_2FA",
+     * Every other outcome ("NO_FACE", "TIMEOUT", "DENIED", "SPOOF", "RATE_LIMITED",
      * or any unknown status/error) returns PAM_IGNORE.
      *
      * Why PAM_IGNORE for all non-granted cases?
@@ -190,10 +197,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
      * to standard password authentication (pam_unix.so). Biometric failures can
      * NEVER lock a user out of their own machine.
      */
-    if (!strcmp(result, "GRANTED"))
-        return PAM_SUCCESS;
-
-    return PAM_IGNORE;
+    return granted ? PAM_SUCCESS : PAM_IGNORE;
 }
 
 /* pam_sm_setcred: required export for PAM_SM_AUTH modules.

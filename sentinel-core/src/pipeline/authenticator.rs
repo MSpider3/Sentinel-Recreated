@@ -1,71 +1,97 @@
 /// authenticator.rs
-/// Full port of `SentinelAuthenticator` from biometric_processor.py
-/// Exact state machine, tier thresholds, liveness challenges, blacklist checking,
-/// adaptive template learning, and audit logging.
+/// One authentication session: takes camera frames one at a time and decides
+/// between Success, Failure, Spoof, NoFace and Timeout.
+///
+/// Per frame: warm-up → detect → quality gate → align → embed → match →
+/// anti-spoof → `Decision` (see decision.rs for the grant rules).
 
-use anyhow::Result;
-use image::RgbImage;
+use anyhow::{Context, Result};
 use std::time::Instant;
 
 use crate::audit::{AuditLogger, AuditRecord};
 use crate::config::SentinelConfig;
-use crate::gallery::{AdaptiveGallery, BlacklistManager};
+use crate::gallery::{AdaptiveGallery, IntrusionLog};
 use crate::pipeline::{
     align::align_face,
-    detect::ScrfdDetector,
-    embed::MobileFaceNet,
-    liveness::{BlinkDetector, HeadPoseChallenge, HeadPoseDetector},
-    r#match::{match_gallery_with_config, AuthTier},
-    spoof::SpoofDetector,
+    capture::CapturedFrame,
+    decision::{Decision, Verdict},
+    models::Models,
+    quality,
+    r#match::{decide_tier_with_config, match_gallery_with_config, AuthTier},
 };
 
-// ─── Thresholds (matching BiometricConfig in Python prototype) ─────────────────
-#[allow(dead_code)]
-const GOLDEN_THRESHOLD: f32 = 0.25;
-#[allow(dead_code)]
-const STANDARD_THRESHOLD: f32 = 0.42;
-#[allow(dead_code)]
-const TWO_FACTOR_THRESHOLD: f32 = 0.50;
+/// Seconds without any face in view before the session ends as NoFace.
+const NO_FACE_TIMEOUT_SECS: f64 = 3.0;
 
-const MAX_RETRIES: u32 = 3;
-const CHALLENGE_TIMEOUT_SECS: f64 = 20.0;
-/// Frames without a face before a session reset (only applies when state != Waiting)
-const SESSION_RESET_GRACE_PERIOD: u32 = 30;
-/// Max pixel movement between frames before we lose face-lock
-const MAX_MOVEMENT_THRESHOLD_SQ: f32 = 200.0 * 200.0;
-/// Number of initial frames to skip to allow camera auto-exposure to stabilise.
-/// Cold cameras often produce dark or blurry frames for the first few ticks.
-const WARMUP_FRAMES: u32 = 5;
+// ─── Camera warm-up ────────────────────────────────────────────────────────────
+// A camera that has just been switched on needs a moment for auto-exposure to
+// settle; its first frames are dark or washed out. Frames are skipped until
+// the overall brightness stops changing.
+
+/// Frames darker than this (mean luma, 0..255) are never considered settled.
+const MIN_LUMA: f64 = 15.0;
+/// Largest frame-to-frame change in mean luma that still counts as settled.
+const LUMA_SETTLED_DELTA: f64 = 3.0;
+/// Settled frames in a row required before recognition starts.
+const LUMA_SETTLED_FRAMES: u32 = 2;
+/// Recognition starts after this long even if brightness never settles; the
+/// quality gate then decides frame by frame.
+const MAX_WARMUP_SECS: f64 = 1.0;
+
+struct Warmup {
+    prev_luma: Option<f64>,
+    settled_frames: u32,
+    started: Option<Instant>,
+    done: bool,
+}
+
+impl Warmup {
+    fn new() -> Self {
+        Self { prev_luma: None, settled_frames: 0, started: None, done: false }
+    }
+
+    /// Feed the mean luma of each new frame; true once frames may be used.
+    fn ready(&mut self, luma: f64) -> bool {
+        if self.done {
+            return true;
+        }
+        let started = *self.started.get_or_insert_with(Instant::now);
+
+        let settled = luma >= MIN_LUMA
+            && self.prev_luma.map_or(false, |prev| (luma - prev).abs() <= LUMA_SETTLED_DELTA);
+        self.settled_frames = if settled { self.settled_frames + 1 } else { 0 };
+        self.prev_luma = Some(luma);
+
+        self.done = self.settled_frames >= LUMA_SETTLED_FRAMES
+            || started.elapsed().as_secs_f64() > MAX_WARMUP_SECS;
+        if self.done {
+            log::debug!(
+                "[Auth] Camera warm-up done {} ms after its first frame (luma {:.0}, settled: {})",
+                started.elapsed().as_millis(),
+                luma,
+                self.settled_frames >= LUMA_SETTLED_FRAMES
+            );
+        }
+        self.done
+    }
+}
 
 // ─── State Machine ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthState {
+    /// Still looking; feed more frames.
     Waiting,
-    Recognized, // Doing head-pose challenge + blink
+    /// Access granted.
     Success,
+    /// Several frames in a row showed a clearly different person.
     Failure,
-    Require2FA,
+    /// The face matched but repeatedly looked like a photo or screen.
+    Spoof,
+    /// Nobody in front of the camera.
     NoFace,
-}
-
-/// Tier in use for the current session — mirrors Python `active_tier`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActiveTier {
-    Golden,    // Tier 1: d < 0.25
-    Standard,  // Tier 2: 0.25 <= d < 0.42
-    TwoFactor, // Tier 3: 0.42 <= d <= 0.50
-}
-
-impl ActiveTier {
-    fn from_auth_tier(t: &AuthTier) -> Option<Self> {
-        match t {
-            AuthTier::Golden => Some(Self::Golden),
-            AuthTier::Standard => Some(Self::Standard),
-            AuthTier::TwoFactor => Some(Self::TwoFactor),
-            AuthTier::Denied => None,
-        }
-    }
+    /// Time ran out without enough proof either way.
+    Timeout,
 }
 
 /// Output of every `process_frame` call.
@@ -75,263 +101,68 @@ pub struct AuthResult {
     pub message: String,
     /// Active face bounding box [x1, y1, x2, y2], if any.
     pub face_box: Option<[f32; 4]>,
-    /// Matched user name (set once recognised).
+    /// Matched user name (set once access is granted).
     pub matched_user: Option<String>,
-    /// Cosine distance to best gallery match.
+    /// Cosine distance to best gallery match on the latest evaluated frame.
     pub distance: Option<f32>,
-    /// Current active tier (set once recognised).
-    pub active_tier: Option<ActiveTier>,
-    /// Anti-spoof confidence score (if MiniFASNet ran).
+    /// Match tier of the latest evaluated frame.
+    pub active_tier: Option<AuthTier>,
+    /// Anti-spoof "real" score of the latest matching frame.
     pub spoof_score: Option<f32>,
-}
-
-// ─── Liveness Checklist (mirrors LivenessValidator) ───────────────────────────
-
-struct LivenessChecklist {
-    spoof_ok: bool,
-    challenge_ok: bool,
-    blink_ok: bool,
-    challenge_type: HeadPoseChallenge,
-    challenge_start_time: Instant,
-    /// Nose position when challenge first started for delta tracking.
-    challenge_start_pos: Option<(f32, f32)>,
-}
-
-impl LivenessChecklist {
-    fn new(challenge: HeadPoseChallenge) -> Self {
-        Self {
-            spoof_ok: false,
-            challenge_ok: false,
-            blink_ok: false,
-            challenge_type: challenge,
-            challenge_start_time: Instant::now(),
-            challenge_start_pos: None,
-        }
-    }
-
-    fn all_passed(&self) -> bool {
-        self.spoof_ok && self.challenge_ok && self.blink_ok
-    }
-
-    fn timed_out(&self) -> bool {
-        self.challenge_start_time.elapsed().as_secs_f64() > CHALLENGE_TIMEOUT_SECS
-    }
-
-    /// Check head-pose challenge via nose landmark movement.
-    fn update_motion_challenge(&mut self, face_box: &[f32; 4], nose: (f32, f32)) -> bool {
-        if self.challenge_ok {
-            return true;
-        }
-        let w = face_box[2] - face_box[0];
-        let motion_threshold = w * 0.08;
-
-        let start = match self.challenge_start_pos {
-            Some(p) => p,
-            None => {
-                self.challenge_start_pos = Some(nose);
-                return false;
-            }
-        };
-
-        let delta_x = nose.0 - start.0;
-        let delta_y = nose.1 - start.1;
-
-        println!(
-            "[Challenge {:?}] nose=({:.1},{:.1}) start=({:.1},{:.1}) delta=({:.1},{:.1}) thresh={:.1}",
-            self.challenge_type, nose.0, nose.1, start.0, start.1, delta_x, delta_y, motion_threshold
-        );
-
-        let done = match self.challenge_type {
-            HeadPoseChallenge::TurnLeft => delta_x < -motion_threshold,
-            HeadPoseChallenge::TurnRight => delta_x > motion_threshold,
-            HeadPoseChallenge::TiltUp => delta_y < -motion_threshold,
-            HeadPoseChallenge::TiltDown => delta_y > motion_threshold,
-        };
-        if done {
-            self.challenge_ok = true;
-        }
-        done
-    }
-
-    fn challenge_name(&self) -> &'static str {
-        match self.challenge_type {
-            HeadPoseChallenge::TurnLeft => "Turn LEFT",
-            HeadPoseChallenge::TurnRight => "Turn RIGHT",
-            HeadPoseChallenge::TiltUp => "Tilt UP",
-            HeadPoseChallenge::TiltDown => "Tilt DOWN",
-        }
-    }
+    /// True once at least one good-quality face was compared to the gallery.
+    pub face_evaluated: bool,
 }
 
 // ─── SentinelAuthenticator ─────────────────────────────────────────────────────
 
-/// Full authentication engine — port of Python SentinelAuthenticator.
 pub struct SentinelAuthenticator {
-    // Models (mandatory)
-    pub detector: ScrfdDetector,
-    pub embedder: MobileFaceNet,
-    pub head_pose: HeadPoseDetector,
-    // Optional spoof model
-    pub spoof: Option<SpoofDetector>,
-    // Gallery: list of L2-normalised 512-d embeddings
-    pub gallery: Vec<[f32; 512]>,
+    /// Enrolled templates (L2-normalised 512-d). Never modified here.
+    pub core_gallery: Vec<[f32; 512]>,
+    /// Templates learned after enrollment.
+    pub adaptive_gallery: Vec<[f32; 512]>,
     pub target_user: String,
     pub config: SentinelConfig,
 
-    // State machine
     state: AuthState,
     message: String,
-
-    // Face tracking
-    locked_face_center: Option<(f32, f32)>,
-
-    // Recognized-phase data
-    matched_user: Option<String>,
-    last_distance: Option<f32>,
-    active_tier: Option<ActiveTier>,
-    last_spoof_score: Option<f32>,
-
-    // Liveness
-    liveness: Option<LivenessChecklist>,
-    blink_detector: BlinkDetector,
-    frames_no_face: u32,
+    decision: Decision,
+    warmup: Warmup,
+    session_start: Instant,
     no_face_start: Option<Instant>,
 
-    // Retry / timeout
-    retry_count: u32,
-    session_start: Instant,
+    last_distance: Option<f32>,
+    last_tier: Option<AuthTier>,
+    last_spoof_score: Option<f32>,
+    face_evaluated: bool,
 
-    // Random challenge sequence
-    challenge_rng_idx: usize,
-
-    // Camera warmup: counts frames elapsed since start/reset.
-    // Face detection is skipped until this reaches WARMUP_FRAMES so that
-    // auto-exposure has time to stabilise on cold camera start.
-    warmup_frames_elapsed: u32,
-
-    // Audit logger
     audit_logger: AuditLogger,
-    blacklist_mgr: BlacklistManager,
-}
-
-fn random_challenge(rng_idx: usize) -> HeadPoseChallenge {
-    match rng_idx % 4 {
-        0 => HeadPoseChallenge::TurnLeft,
-        1 => HeadPoseChallenge::TurnRight,
-        2 => HeadPoseChallenge::TiltUp,
-        _ => HeadPoseChallenge::TiltDown,
-    }
+    intrusion_log: IntrusionLog,
 }
 
 impl SentinelAuthenticator {
     pub fn new(
-        detector: ScrfdDetector,
-        embedder: MobileFaceNet,
-        gallery: Vec<[f32; 512]>,
+        core_gallery: Vec<[f32; 512]>,
+        adaptive_gallery: Vec<[f32; 512]>,
         target_user: String,
-        spoof: Option<SpoofDetector>,
-    ) -> Self {
-        Self::new_with_config(
-            detector,
-            embedder,
-            gallery,
-            target_user,
-            spoof,
-            SentinelConfig::default(),
-        )
-    }
-
-    pub fn new_with_config(
-        detector: ScrfdDetector,
-        embedder: MobileFaceNet,
-        gallery: Vec<[f32; 512]>,
-        target_user: String,
-        spoof: Option<SpoofDetector>,
         config: SentinelConfig,
     ) -> Self {
-        let rng_idx = (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos() as usize)
-            % 4;
-
         Self {
-            detector,
-            embedder,
-            head_pose: HeadPoseDetector::new(),
-            spoof,
-            gallery,
+            core_gallery,
+            adaptive_gallery,
             target_user,
+            decision: Decision::new(&config.security),
             config,
             state: AuthState::Waiting,
             message: "Initialising camera...".to_string(),
-            locked_face_center: None,
-            matched_user: None,
-            last_distance: None,
-            active_tier: None,
-            last_spoof_score: None,
-            liveness: None,
-            blink_detector: BlinkDetector::new(),
-            frames_no_face: 0,
-            no_face_start: None,
-            retry_count: 0,
+            warmup: Warmup::new(),
             session_start: Instant::now(),
-            challenge_rng_idx: rng_idx,
-            warmup_frames_elapsed: 0,
+            no_face_start: None,
+            last_distance: None,
+            last_tier: None,
+            last_spoof_score: None,
+            face_evaluated: false,
             audit_logger: AuditLogger::new(),
-            blacklist_mgr: BlacklistManager::new(),
-        }
-    }
-
-    fn active_tier_num(&self) -> u32 {
-        match self.active_tier {
-            Some(ActiveTier::Golden) => 1,
-            Some(ActiveTier::Standard) => 2,
-            Some(ActiveTier::TwoFactor) => 3,
-            None => 4,
-        }
-    }
-
-    fn log_audit(&self, result: &str, tier: u32, liveness_status: &str) {
-        let duration_ms = self.session_start.elapsed().as_millis() as u64;
-        let user_str = self
-            .matched_user
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string());
-        let record = AuditRecord::new_now(
-            user_str,
-            result,
-            self.last_distance,
-            tier,
-            liveness_status,
-            self.last_spoof_score,
-            duration_ms,
-        );
-        let _ = self.audit_logger.log(&record);
-    }
-
-    fn center_of(bbox: &[f32; 4]) -> (f32, f32) {
-        ((bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0)
-    }
-
-    fn dist_sq(a: (f32, f32), b: (f32, f32)) -> f32 {
-        (a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)
-    }
-
-    fn reset(&mut self, full_reset: bool) {
-        self.state = AuthState::Waiting;
-        self.locked_face_center = None;
-        self.liveness = None;
-        self.frames_no_face = 0;
-        self.no_face_start = None;
-        self.blink_detector = BlinkDetector::new();
-        // Reset warmup so that if the camera is re-opened or the pipeline is
-        // restarted we skip the first few frames again.
-        if full_reset {
-            self.warmup_frames_elapsed = 0;
-            self.matched_user = None;
-            self.last_distance = None;
-            self.active_tier = None;
+            intrusion_log: IntrusionLog::new(),
         }
     }
 
@@ -340,493 +171,205 @@ impl SentinelAuthenticator {
             state: self.state.clone(),
             message: self.message.clone(),
             face_box,
-            matched_user: self.matched_user.clone(),
+            matched_user: (self.state == AuthState::Success).then(|| self.target_user.clone()),
             distance: self.last_distance,
-            active_tier: self.active_tier,
+            active_tier: self.last_tier,
             spoof_score: self.last_spoof_score,
+            face_evaluated: self.face_evaluated,
         }
     }
 
-    /// Process one camera frame through the full authentication pipeline.
-    pub fn process_frame(&mut self, frame: &RgbImage) -> Result<AuthResult> {
-        // Fast-fail timer ONLY applies in AuthState::Waiting
-        if self.state != AuthState::Waiting {
-            self.no_face_start = None;
-        }
-
-        // ── Global timeout ──────────────────────────────────────────────────
-        let global_timeout = self.config.security.global_session_timeout;
-        if self.session_start.elapsed().as_secs_f64() > global_timeout {
-            self.state = AuthState::Failure;
-            self.message = "Session timed out.".to_string();
-            self.log_audit("TIMEOUT", 4, "SKIPPED");
-            return Ok(self.make_result(None));
-        }
-
-        // ── Max retries lockout ─────────────────────────────────────────────
-        if self.retry_count >= MAX_RETRIES {
-            self.state = AuthState::Failure;
-            self.message = "Maximum attempts reached.".to_string();
-            self.log_audit("TIMEOUT", 4, "CHALLENGE_TIMEOUT");
-            return Ok(self.make_result(None));
-        }
-
-        // ── Camera warmup ───────────────────────────────────────────────────
-        // Skip the first WARMUP_FRAMES frames so the camera's automatic
-        // exposure / white-balance can stabilise. Dark or blurry warmup frames
-        // would produce spurious "no face" results; silently dropping them is
-        // safer than treating them as detection failures.
-        if self.warmup_frames_elapsed < WARMUP_FRAMES {
-            self.warmup_frames_elapsed += 1;
-            self.message = format!(
-                "Initialising camera... ({}/{})",
-                self.warmup_frames_elapsed, WARMUP_FRAMES
-            );
-            return Ok(self.make_result(None));
-        }
-
-        // ── Face detection ──────────────────────────────────────────────────
-        let detections = self.detector.detect(frame)?;
-
-        let active_face: Option<[f32; 4]> = if detections.is_empty() {
-            None
-        } else if let Some(locked) = self.locked_face_center {
-            let best = detections
-                .iter()
-                .min_by(|a, b| {
-                    let da = Self::dist_sq(Self::center_of(&a.bbox), locked);
-                    let db = Self::dist_sq(Self::center_of(&b.bbox), locked);
-                    da.partial_cmp(&db).unwrap()
-                })
-                .unwrap();
-            let center = Self::center_of(&best.bbox);
-            if Self::dist_sq(center, locked) < MAX_MOVEMENT_THRESHOLD_SQ {
-                Some(best.bbox)
-            } else {
-                None
-            }
-        } else {
-            let largest = detections
-                .iter()
-                .max_by(|a, b| {
-                    let wa = a.bbox[2] - a.bbox[0];
-                    let ha = a.bbox[3] - a.bbox[1];
-                    let wb = b.bbox[2] - b.bbox[0];
-                    let hb = b.bbox[3] - b.bbox[1];
-                    (wa * ha).partial_cmp(&(wb * hb)).unwrap()
-                })
-                .unwrap();
-            Some(largest.bbox)
+    /// End the session in `state`, write the audit record and return the result.
+    fn finish(&mut self, state: AuthState, message: &str, face_box: Option<[f32; 4]>) -> AuthResult {
+        let result = match state {
+            AuthState::Success => "GRANTED",
+            AuthState::Spoof => "SPOOF",
+            AuthState::Timeout => "TIMEOUT",
+            _ => "DENIED",
         };
+        let tier = match self.last_tier {
+            Some(AuthTier::Golden) => 1,
+            Some(AuthTier::Standard) => 2,
+            Some(AuthTier::TwoFactor) => 3,
+            Some(AuthTier::Denied) | None => 4,
+        };
+        let user = if state == AuthState::Success { self.target_user.as_str() } else { "unknown" };
+        let liveness = if self.last_spoof_score.is_some() { "PASSIVE" } else { "SKIPPED" };
+        let record = AuditRecord::new_now(
+            user,
+            result,
+            self.last_distance,
+            tier,
+            liveness,
+            self.last_spoof_score,
+            self.session_start.elapsed().as_millis() as u64,
+        );
+        let _ = self.audit_logger.log(&record);
 
-        // ── Face lost handling ───────────────────────────────────────────────
-        if active_face.is_none() {
-            self.frames_no_face += 1;
-            if self.state == AuthState::Waiting {
-                let start = *self.no_face_start.get_or_insert_with(Instant::now);
-                if start.elapsed().as_secs_f64() > 3.0 {
-                    println!("[Auth] No face detected for 3.0s in Waiting state — fast-failing session.");
+        self.state = state;
+        self.message = message.to_string();
+        self.make_result(face_box)
+    }
+
+    /// End a still-running session because time ran out (for callers that
+    /// are waiting on a camera which has stopped delivering frames).
+    pub fn expire(&mut self) -> AuthResult {
+        if self.state != AuthState::Waiting {
+            return self.make_result(None);
+        }
+        self.finish(AuthState::Timeout, "Session timed out.", None)
+    }
+
+    /// `expire()` the session if its time is up. Returns true when it did.
+    pub fn expire_if_overdue(&mut self) -> bool {
+        let overdue = self.state == AuthState::Waiting
+            && self.session_start.elapsed().as_secs_f64() > self.config.security.global_session_timeout;
+        if overdue {
+            self.expire();
+        }
+        overdue
+    }
+
+    /// Process one new camera frame. An `Err` means this frame could not be
+    /// used; it never grants access and the caller simply feeds the next one.
+    pub fn process_frame(&mut self, models: &mut Models, captured: &CapturedFrame) -> Result<AuthResult> {
+        if self.state != AuthState::Waiting {
+            return Ok(self.make_result(None));
+        }
+
+        if self.session_start.elapsed().as_secs_f64() > self.config.security.global_session_timeout {
+            return Ok(self.finish(AuthState::Timeout, "Session timed out.", None));
+        }
+
+        if !self.warmup.ready(captured.luma) {
+            self.message = "Initialising camera...".to_string();
+            return Ok(self.make_result(None));
+        }
+
+        // ── Face detection: the largest face is the one being authenticated ──
+        let frame = &captured.image;
+        let detections = models.detector.detect(frame)?;
+        let area = |b: &[f32; 4]| (b[2] - b[0]) * (b[3] - b[1]);
+        let face = match detections.iter().max_by(|a, b| area(&a.bbox).total_cmp(&area(&b.bbox))) {
+            Some(face) => face,
+            None => {
+                let since = *self.no_face_start.get_or_insert_with(Instant::now);
+                if since.elapsed().as_secs_f64() > NO_FACE_TIMEOUT_SECS {
                     self.state = AuthState::NoFace;
                     self.message = "No face detected.".to_string();
-                    return Ok(self.make_result(None));
+                } else {
+                    self.message = "No face detected. Look at camera.".to_string();
                 }
+                return Ok(self.make_result(None));
             }
-            if self.frames_no_face > SESSION_RESET_GRACE_PERIOD && self.state != AuthState::Waiting {
-                println!("[Auth] Face lost — resetting session.");
-                self.reset(false);
-                self.message = "Face lost. Please re-center.".to_string();
-            } else {
-                self.message = "No face detected. Look at camera.".to_string();
-            }
-            return Ok(self.make_result(None));
-        }
-
-        self.frames_no_face = 0;
+        };
         self.no_face_start = None;
-        let bbox = active_face.unwrap();
-        self.locked_face_center = Some(Self::center_of(&bbox));
+        let bbox = face.bbox;
 
-        // ── Calibration check ────────────────────────────────────────────────
-        if let Some(ref mut spoof) = self.spoof {
-            if spoof.is_calibrating() {
-                if let Ok(crop) = SpoofDetector::square_crop(frame, bbox, 1.5) {
-                    spoof.calibrate_tick(&crop);
-                    let n = spoof.calib_samples_len();
-                    self.message = format!("Calibrating anti-spoof... ({}/80)", n);
-                    return Ok(self.make_result(Some(bbox)));
-                }
-            }
+        // ── Quality gate: a poor frame is skipped, never counted as a mismatch ──
+        if let Err(issue) = quality::check_pose(&face.landmarks, frame.width(), frame.height()) {
+            self.message = issue.hint().to_string();
+            return Ok(self.make_result(Some(bbox)));
         }
-
-        // ─────────────────────────────────────────────────────────────────────
-        // STATE: WAITING — scan, embed, blacklist check, match, classify tier
-        // ─────────────────────────────────────────────────────────────────────
-        if self.state == AuthState::Waiting {
-            self.message = "Scanning face...".to_string();
-
-            let det_with_kps = detections.iter().find(|d| {
-                (d.bbox[0] - bbox[0]).abs() < 5.0 && (d.bbox[1] - bbox[1]).abs() < 5.0
-            });
-
-            let aligned = if let Some(det) = det_with_kps {
-                align_face(frame, &det.landmarks).ok()
-            } else {
-                None
-            };
-
-            if let Some(aligned_img) = aligned {
-                match self.embedder.embed(&aligned_img) {
-                    Ok(embedding) => {
-                        // 1. Blacklist Check (BEFORE tier decision!)
-                        if self.blacklist_mgr.check(&embedding) {
-                            println!("[Auth] Intrusion matching blacklist (d < 0.25) — access denied immediately.");
-                            self.state = AuthState::Failure;
-                            self.message = "Access Denied: Restricted Identity".to_string();
-                            self.log_audit("DENIED", 4, "SKIPPED");
-                            return Ok(self.make_result(Some(bbox)));
-                        }
-
-                        if self.gallery.is_empty() {
-                            self.state = AuthState::Failure;
-                            self.message = "No gallery loaded.".to_string();
-                            self.log_audit("DENIED", 4, "SKIPPED");
-                            return Ok(self.make_result(Some(bbox)));
-                        }
-
-                        // 2. Identification / Tier matching
-                        let (dist, tier) = match_gallery_with_config(&embedding, &self.gallery, &self.config.security);
-                        self.last_distance = Some(dist);
-                        println!("[Auth] Distance={:.4}  Tier={:?}", dist, tier);
-
-                        match ActiveTier::from_auth_tier(&tier) {
-                            None => {
-                                // Tier 4: Denied (skip spoof check — already denied)
-                                println!("[Auth] Unknown face — access denied.");
-                                self.state = AuthState::Failure;
-                                self.message = "Access Denied.".to_string();
-
-                                // Save intruder screenshot + embedding to blacklist
-                                if let Err(e) = self.blacklist_mgr.add_intruder(&embedding, frame) {
-                                    println!("[Auth] Warning: Failed to log intruder to blacklist: {e}");
-                                } else {
-                                    println!("[Auth] Intruder logged to blacklist.");
-                                }
-
-                                self.log_audit("DENIED", 4, "SKIPPED");
-                                return Ok(self.make_result(Some(bbox)));
-                            }
-                            Some(active_tier) => {
-                                self.active_tier = Some(active_tier);
-                                self.matched_user = Some(self.target_user.clone());
-
-                                // Tier 3 (2FA): skip spoof check — user will supply password anyway
-                                if active_tier == ActiveTier::TwoFactor {
-                                    println!("[Auth] Tier 3 (2FA Required, d={:.4}) — skipping spoof check.", dist);
-                                    self.state = AuthState::Require2FA;
-                                    self.message = format!("2FA required for user {}", self.target_user);
-                                    self.log_audit("REQUIRE_2FA", 3, "SKIPPED");
-                                    return Ok(self.make_result(Some(bbox)));
-                                }
-
-                                // Tier 1 (Golden) & Tier 2 (Standard): Run per-tier spoof check
-                                let spoof_threshold = match active_tier {
-                                    ActiveTier::Golden => self.config.security.spoof_threshold_golden,
-                                    ActiveTier::Standard => self.config.security.spoof_threshold_standard,
-                                    ActiveTier::TwoFactor => unreachable!(),
-                                };
-
-                                if let Some(ref mut spoof) = self.spoof {
-                                    if let Ok(crop) = SpoofDetector::square_crop(frame, bbox, 1.5) {
-                                        match spoof.predict(&crop) {
-                                            Ok((_is_real, confidence)) => {
-                                                self.last_spoof_score = Some(confidence);
-                                                if confidence < spoof_threshold {
-                                                    self.retry_count += 1;
-                                                    let remaining = MAX_RETRIES.saturating_sub(self.retry_count);
-                                                    println!(
-                                                        "[Auth] Spoof detected for Tier {:?} (conf={:.2} < thresh={:.2}). Retries left: {}",
-                                                        active_tier, confidence, spoof_threshold, remaining
-                                                    );
-                                                    self.reset(true);
-                                                    self.message = format!(
-                                                        "Spoof detected! Attempts left: {}",
-                                                        remaining
-                                                    );
-                                                    return Ok(self.make_result(Some(bbox)));
-                                                }
-                                                if let Some(ref mut lv) = self.liveness {
-                                                    lv.spoof_ok = true;
-                                                }
-                                            }
-                                            Err(e) => {
-                                                println!("[Auth] Spoof error: {e} — skipping");
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Tier 1 (Golden: d < 0.28): Skip head pose and blink challenges unless require_liveness is enabled
-                                if active_tier == ActiveTier::Golden && !self.config.security.require_liveness {
-                                    println!(
-                                        "[Auth] GOLDEN match (d={:.4}) — granting access immediately after spoof check.",
-                                        dist
-                                    );
-                                    self.state = AuthState::Success;
-                                    self.message = format!(
-                                        "Access Granted: {} (Golden Match)",
-                                        self.target_user
-                                    );
-
-                                    // Trigger Adaptive Gallery learning if eligible
-                                    if AdaptiveGallery::should_adapt(
-                                        &self.target_user,
-                                        AuthTier::Golden,
-                                        &self.config,
-                                    ) {
-                                        if let Err(e) = AdaptiveGallery::add_vector(
-                                            &self.target_user,
-                                            &embedding,
-                                            &self.config,
-                                        ) {
-                                            println!("[Auth] Warning: Adaptive template save failed: {e}");
-                                        } else {
-                                            println!("[Auth] Adaptive gallery template saved for {}.", self.target_user);
-                                        }
-                                    }
-
-                                    self.log_audit("GRANTED", 1, "SKIPPED");
-                                    return Ok(self.make_result(Some(bbox)));
-                                }
-
-                                // Tier 2 (Standard): Require head pose challenge -> blink detection
-                                let challenge = random_challenge(self.challenge_rng_idx);
-                                self.challenge_rng_idx = (self.challenge_rng_idx + 1) % 4;
-                                println!(
-                                    "[Auth] Recognized (Tier {:?}, d={:.4}). Starting challenge: {:?}",
-                                    active_tier, dist, challenge
-                                );
-                                self.state = AuthState::Recognized;
-                                let mut lv = LivenessChecklist::new(challenge);
-                                lv.spoof_ok = true;
-                                self.liveness = Some(lv);
-                                self.message = format!(
-                                    "Hi {}! Please: {}",
-                                    self.target_user,
-                                    self.liveness.as_ref().unwrap().challenge_name()
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        self.message = format!("Embed error: {e}");
-                    }
-                }
-            } else {
-                self.message = "Aligning face...".to_string();
-            }
-
+        let aligned = align_face(frame, &face.landmarks)?;
+        if let Err(issue) = quality::check_aligned_face(&aligned) {
+            self.message = issue.hint().to_string();
             return Ok(self.make_result(Some(bbox)));
         }
 
-        // ─────────────────────────────────────────────────────────────────────
-        // STATE: RECOGNIZED — head-pose challenge then blink
-        // ─────────────────────────────────────────────────────────────────────
-        if self.state == AuthState::Recognized {
-            // Re-verify the subject on the CURRENT frame before trusting any
-            // challenge progress. The identity decision was made on a single
-            // Waiting-state frame; without this check the face in front of the
-            // camera can be swapped for any other moving presentation while the
-            // challenge machinery completes and grants `matched_user`.
-            {
-                let det_with_kps = detections.iter().find(|d| {
-                    (d.bbox[0] - bbox[0]).abs() < 5.0 && (d.bbox[1] - bbox[1]).abs() < 5.0
-                });
+        // ── Match ────────────────────────────────────────────────────────────
+        let embedding = models.embedder.embed(&aligned)?;
+        let security = &self.config.security;
+        let (core_distance, _) = match_gallery_with_config(&embedding, &self.core_gallery, security);
+        let (adaptive_distance, _) = match_gallery_with_config(&embedding, &self.adaptive_gallery, security);
+        let distance = core_distance.min(adaptive_distance);
+        let tier = decide_tier_with_config(distance, security);
+        self.last_distance = Some(distance);
+        self.last_tier = Some(tier);
+        self.face_evaluated = true;
 
-                let mut subject_ok = false;
-
-                if let Some(det) = det_with_kps {
-                    if let Ok(aligned) = align_face(frame, &det.landmarks) {
-                        if let Ok(embedding) = self.embedder.embed(&aligned) {
-                            if !self.blacklist_mgr.check(&embedding) {
-                                let (_dist, tier) = match_gallery_with_config(
-                                    &embedding,
-                                    &self.gallery,
-                                    &self.config.security,
-                                );
-                                // The subject must still match the gallery at a
-                                // grantable tier (Golden or Standard).
-                                let tier_ok = match ActiveTier::from_auth_tier(&tier) {
-                                    Some(ActiveTier::Golden) | Some(ActiveTier::Standard) => true,
-                                    _ => false,
-                                };
-                                // The spoof verdict must hold for the challenge
-                                // frames too, and fails CLOSED here if spoof detector is active.
-                                let spoof_ok = if let Some(ref mut spoof) = self.spoof {
-                                    match SpoofDetector::square_crop(frame, bbox, 1.5) {
-                                        Ok(crop) => match spoof.predict(&crop) {
-                                            Ok((_is_real, confidence)) => {
-                                                self.last_spoof_score = Some(confidence);
-                                                let spoof_threshold = match self.active_tier {
-                                                    Some(ActiveTier::Golden) => {
-                                                        self.config.security.spoof_threshold_golden
-                                                    }
-                                                    _ => self.config.security.spoof_threshold_standard,
-                                                };
-                                                confidence >= spoof_threshold
-                                            }
-                                            Err(_) => false,
-                                        },
-                                        Err(_) => false,
-                                    }
-                                } else {
-                                    true
-                                };
-                                subject_ok = tier_ok && spoof_ok;
-                            }
-                        }
-                    }
-                }
-
-                if !subject_ok {
-                    self.retry_count += 1;
-                    let remaining = MAX_RETRIES.saturating_sub(self.retry_count);
-                    println!(
-                        "[Auth] Subject changed during challenge — aborting. Retries left: {}",
-                        remaining
-                    );
-                    self.log_audit("DENIED", self.active_tier_num(), "SUBJECT_CHANGED");
-                    self.reset(true);
-                    self.message = format!("Subject changed! Attempts left: {}", remaining);
-                    return Ok(self.make_result(Some(bbox)));
-                }
+        // ── Anti-spoof, on the same frame that matched ───────────────────────
+        // Not run for non-matching faces: they cannot be granted anyway.
+        let spoof_score = match tier {
+            AuthTier::Golden | AuthTier::Standard => {
+                let spoof = models.spoof.as_mut().context("Anti-spoof model unavailable")?;
+                let score = spoof.predict(frame, bbox)?;
+                self.last_spoof_score = Some(score);
+                score
             }
+            AuthTier::TwoFactor | AuthTier::Denied => 0.0,
+        };
+        log::debug!("[Auth] distance={:.4} tier={:?} spoof={:.3}", distance, tier, spoof_score);
 
-            let lv = match self.liveness.as_mut() {
-                Some(l) => l,
-                None => {
-                    self.reset(false);
-                    return Ok(self.make_result(Some(bbox)));
+        // ── Decision ─────────────────────────────────────────────────────────
+        match self.decision.observe(tier, distance, spoof_score) {
+            Verdict::Continue => {
+                self.message = match tier {
+                    AuthTier::Golden | AuthTier::Standard => "Verifying...",
+                    AuthTier::TwoFactor | AuthTier::Denied => "Not recognised yet. Look straight at the camera.",
                 }
-            };
-
-            // Challenge timeout check
-            if lv.timed_out() {
-                self.retry_count += 1;
-                let remaining = MAX_RETRIES.saturating_sub(self.retry_count);
-                println!("[Auth] Challenge timed out. Retries left: {}", remaining);
-
-                let liveness_status = if lv.challenge_ok {
-                    "BLINK_TIMEOUT"
-                } else {
-                    "CHALLENGE_TIMEOUT"
-                };
-                self.log_audit("TIMEOUT", self.active_tier_num(), liveness_status);
-
-                self.reset(true);
-                self.message = format!("Too slow! Attempts left: {}", remaining);
-                return Ok(self.make_result(Some(bbox)));
+                .to_string();
+                Ok(self.make_result(Some(bbox)))
             }
-
-            let nose: (f32, f32) = detections
-                .iter()
-                .find(|d| {
-                    (d.bbox[0] - bbox[0]).abs() < 15.0 && (d.bbox[1] - bbox[1]).abs() < 15.0
-                })
-                .map(|d| (d.landmarks[2][0], d.landmarks[2][1]))
-                .unwrap_or_else(|| Self::center_of(&bbox));
-
-            if !lv.challenge_ok {
-                // Stage 2a: head-pose motion challenge
-                let challenge_name = lv.challenge_name();
-                if lv.update_motion_challenge(&bbox, nose) {
-                    println!("[Auth] Head pose challenge passed!");
-                    self.message = "Good! Now please blink.".to_string();
-                } else {
-                    self.message = format!(
-                        "Hi {}! {}",
-                        self.matched_user.as_deref().unwrap_or("?"),
-                        challenge_name
-                    );
-                }
-            } else {
-                // Stage 2b: blink detection (only after challenge)
-                self.message = "Please blink now...".to_string();
-
-                let ear_val = self.compute_ear_from_detection(frame, &bbox, &detections);
-                if let Some(ear) = ear_val {
-                    let blinked = self.blink_detector.update(ear);
-                    if blinked {
-                        println!("[Auth] Blink detected!");
-                        if let Some(ref mut lv2) = self.liveness {
-                            lv2.blink_ok = true;
-                        }
+            Verdict::Grant { golden } => {
+                if golden
+                    && AdaptiveGallery::should_adapt(
+                        &self.target_user,
+                        core_distance,
+                        distance,
+                        spoof_score,
+                        &self.config,
+                    )
+                {
+                    match AdaptiveGallery::add_vector(&self.target_user, &embedding, &self.config) {
+                        Ok(()) => log::info!("[Auth] Learned a new template for {}.", self.target_user),
+                        Err(e) => log::warn!("[Auth] Could not save learned template: {e}"),
                     }
                 }
+                let message = format!("Access Granted: {}", self.target_user);
+                Ok(self.finish(AuthState::Success, &message, Some(bbox)))
             }
-
-            // Check if all checks passed
-            let all_passed = self.liveness.as_ref().map(|l| l.all_passed()).unwrap_or(false);
-            if all_passed {
-                match self.active_tier {
-                    Some(ActiveTier::TwoFactor) => {
-                        self.state = AuthState::Require2FA;
-                        self.message = format!(
-                            "2FA Required: {}",
-                            self.matched_user.as_deref().unwrap_or("?")
-                        );
-                        println!("[Auth] Biometrics passed — 2FA required.");
-                        self.log_audit("REQUIRE_2FA", 3, "BLINK_PASSED");
-                    }
-                    _ => {
-                        self.state = AuthState::Success;
-                        self.message = format!(
-                            "Access Granted: {}",
-                            self.matched_user.as_deref().unwrap_or("?")
-                        );
-                        println!("[Auth] Access GRANTED.");
-                        let tier_num = self.active_tier_num();
-                        self.log_audit("GRANTED", tier_num, "BLINK_PASSED");
-                    }
+            Verdict::Spoof => Ok(self.finish(AuthState::Spoof, "Spoof detected.", Some(bbox))),
+            Verdict::Denied => {
+                if let Err(e) = self.intrusion_log.save(frame) {
+                    log::warn!("[Auth] Could not save intrusion photo: {e}");
                 }
+                Ok(self.finish(AuthState::Failure, "Access Denied.", Some(bbox)))
             }
         }
+    }
+}
 
-        Ok(self.make_result(Some(bbox)))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_warmup_waits_for_brightness_to_settle() {
+        let mut w = Warmup::new();
+        // Auto-exposure ramping up: brightness still changing.
+        assert!(!w.ready(5.0));
+        assert!(!w.ready(40.0));
+        assert!(!w.ready(80.0));
+        // Two frames in a row within the settled delta.
+        assert!(!w.ready(81.0));
+        assert!(w.ready(82.0));
+        // Once ready it stays ready, whatever the brightness does.
+        assert!(w.ready(10.0));
     }
 
-    fn compute_ear_from_detection(
-        &self,
-        _frame: &RgbImage,
-        bbox: &[f32; 4],
-        detections: &[crate::pipeline::detect::FaceDetection],
-    ) -> Option<f32> {
-        let det = detections.iter().find(|d| {
-            (d.bbox[0] - bbox[0]).abs() < 10.0 && (d.bbox[1] - bbox[1]).abs() < 10.0
-        })?;
+    #[test]
+    fn test_warmup_ignores_a_stable_but_black_picture() {
+        let mut w = Warmup::new();
+        assert!(!w.ready(3.0));
+        assert!(!w.ready(3.0));
+        assert!(!w.ready(3.0));
+    }
 
-        let kps = det.landmarks;
-        let left_eye = kps[0];
-        let right_eye = kps[1];
-        let nose = kps[2];
-        let l_mouth = kps[3];
-        let r_mouth = kps[4];
-
-        let _eye_cx = (left_eye[0] + right_eye[0]) / 2.0;
-        let eye_cy = (left_eye[1] + right_eye[1]) / 2.0;
-        let eye_dist =
-            ((left_eye[0] - right_eye[0]).powi(2) + (left_eye[1] - right_eye[1]).powi(2)).sqrt();
-
-        let mouth_cy = (l_mouth[1] + r_mouth[1]) / 2.0;
-        let face_h = mouth_cy - eye_cy;
-
-        if eye_dist < 1e-3 || face_h < 1e-3 {
-            return None;
-        }
-
-        let eye_to_nose_y = (nose[1] - eye_cy).abs();
-        let ear_proxy = eye_to_nose_y / (face_h + 1.0);
-
-        let ear = (ear_proxy * 0.5).clamp(0.0, 1.0);
-        Some(ear)
+    #[test]
+    fn test_warmup_gives_up_waiting_after_a_while() {
+        let mut w = Warmup::new();
+        w.started = Some(Instant::now() - std::time::Duration::from_secs(2));
+        assert!(w.ready(3.0));
     }
 }

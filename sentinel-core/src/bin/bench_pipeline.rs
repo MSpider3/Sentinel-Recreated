@@ -158,11 +158,7 @@ fn main() -> Result<()> {
     ).context("Failed to load MobileFaceNet embedder")?;
 
     let mut spoof_detector = if minifas_path.exists() {
-        SpoofDetector::new(
-            minifas_path.to_str().unwrap(),
-            "/var/lib/sentinel/minifas_calib.json",
-            0.85,
-        ).ok()
+        SpoofDetector::new(&[(minifas_path.to_str().unwrap(), 2.7)]).ok()
     } else {
         None
     };
@@ -229,9 +225,7 @@ fn main() -> Result<()> {
         // Stage 5: MiniFASNet Spoof Check
         let spoof_ms = if let Some(ref mut sd) = spoof_detector {
             let t_spoof_start = Instant::now();
-            if let Ok(crop) = SpoofDetector::square_crop(&frame_img, bbox, 2.7) {
-                let _ = sd.predict(&crop);
-            }
+            let _ = sd.predict(&frame_img, bbox);
             t_spoof_start.elapsed().as_secs_f64() * 1000.0
         } else {
             0.0

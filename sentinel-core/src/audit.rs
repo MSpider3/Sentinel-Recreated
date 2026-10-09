@@ -133,6 +133,42 @@ impl AuditLogger {
         Ok(())
     }
 
+    /// The newest `count` audit lines, oldest first. Reads back through the
+    /// daily files, so the list does not go empty at midnight.
+    pub fn recent_lines(&self, count: usize) -> Vec<String> {
+        let mut files: Vec<PathBuf> = fs::read_dir(&self.dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.file_name()
+                            .and_then(|n| n.to_str())
+                            .map_or(false, |n| n.starts_with("auth_") && n.ends_with(".log"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        files.sort(); // auth_YYYY-MM-DD.log sorts by date
+
+        let mut newest_first: Vec<String> = Vec::new();
+        for file in files.iter().rev() {
+            if newest_first.len() >= count {
+                break;
+            }
+            let content = fs::read_to_string(file).unwrap_or_default();
+            newest_first.extend(
+                content
+                    .lines()
+                    .rev()
+                    .take(count - newest_first.len())
+                    .map(String::from),
+            );
+        }
+        newest_first.reverse();
+        newest_first
+    }
+
     /// Log a record to `/var/log/sentinel/auth_YYYY-MM-DD.log`
     pub fn log(&self, record: &AuditRecord) -> Result<()> {
         let _ = self.init_dir_and_cleanup();
@@ -210,6 +246,18 @@ mod tests {
         // Run cleanup
         logger.cleanup_old_logs(30).unwrap();
         assert!(!old_file.exists());
+
+        // Recent lines span the daily files, oldest first, newest kept.
+        fs::write(tmp_dir.join("auth_2020-01-02.log"), "a\nb\n").unwrap();
+        fs::write(tmp_dir.join("auth_2020-01-03.log"), "c\nd\n").unwrap();
+        let today = fs::read_to_string(
+            tmp_dir.join(format!("auth_{}.log", Local::now().format("%Y-%m-%d"))),
+        )
+        .unwrap();
+        let recent = logger.recent_lines(4);
+        assert_eq!(recent[..3], ["b", "c", "d"]);
+        assert_eq!(recent[3], today.trim_end());
+        assert!(logger.recent_lines(0).is_empty());
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }

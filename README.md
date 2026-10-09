@@ -8,7 +8,7 @@ Face authentication for Linux — unlock sudo, your login screen, and lock scree
 
 ## What It Does
 
-Sentinel runs as a root systemd daemon that performs face recognition via DBus, integrating with PAM so any application that uses PAM (sudo, GDM, greetd, SDDM, swaylock, hyprlock) can authenticate you biometrically. It uses SCRFD for face detection, MobileFaceNet for 512-dimensional embeddings, and MiniFASNetV2 for anti-spoofing. On an Intel i3 10th gen with integrated graphics, the full pipeline runs at **33ms average latency (~30 FPS)**. If the daemon is unavailable or no face is detected, PAM falls through transparently to password — you are never locked out.
+Sentinel runs as a root systemd daemon that performs face recognition via DBus, integrating with PAM so any application that uses PAM (sudo, GDM, greetd, SDDM, swaylock, hyprlock) can authenticate you biometrically. It uses SCRFD for face detection, MobileFaceNet for 512-dimensional embeddings, and two MiniFASNet models for anti-spoofing. On an Intel i3 10th gen with integrated graphics one frame takes about **43 ms**, and a typical unlock takes **0.4–1 second**, most of it the camera switching on. If the daemon is unavailable, no face is found, or the scan is not conclusive within 7 seconds, PAM falls through transparently to password — you are never locked out.
 
 ## Tested Configuration
 
@@ -39,13 +39,13 @@ Full per-environment PAM configuration details: [`docs/PAM_INTEGRATION.md`](docs
 **Hardware**
 - Any Linux system with a 2D RGB webcam (V4L2 compatible)
 - Minimum: Intel Core i3 10th gen or equivalent AMD, 8 GB RAM
-- No discrete GPU required — runs entirely on CPU (or Intel iGPU via OpenVINO)
+- No discrete GPU required — runs entirely on CPU
 
 **Software**
 - Linux with systemd (kernel ≥ 6.6 recommended)
 - Wayland (recommended) or X11
 - GStreamer 1.x with PipeWire or V4L2 support
-- Python 3.10+
+- Python 3.11+
 - Rust toolchain — install from [rustup.rs](https://rustup.rs) if not present
 
 ## Installation
@@ -59,39 +59,57 @@ sentinel enroll $USER
 
 The installer auto-detects your distro, display manager, and lock screen. Run `sudo ./setup.sh --dry-run` first to preview what will be detected and configured without touching any files.
 
+Face unlock is always set up for the lock screen. The installer **asks** before enabling it for `sudo` and for the login screen (`--yes` answers yes to both). Keep a root shell open while installing; `sudo ./scripts/emergency_restore_pam.sh` removes Sentinel from every PAM file if anything goes wrong.
+
 ## Usage
 
 ```bash
-# Enroll your face (run once — guides you through 5 poses)
+# Enroll your face (run once — asks whether you wear glasses, then guides you through 5 poses)
 sentinel enroll $USER
+sentinel enroll $USER --glasses      # or --no-glasses: answer the question in advance
 
 # Check daemon and enrollment status
 sentinel status
 
-# Manually trigger an authentication attempt
+# Run one face scan and show the result, match distance and anti-spoof score
 sentinel auth $USER
 
-# Launch the terminal dashboard (live view of auth sessions)
+# Launch the terminal dashboard
 sentinel dashboard
-
-# Re-run the anti-spoof camera calibration
-sentinel calibrate-spoof
 ```
 
-After enrollment, face unlock is active automatically for any PAM-integrated service (sudo, login screen, lock screen).
+The dashboard has four screens: **Dashboard** (`d`: daemon status and recent scans with distance and anti-spoof score), **Users** (`u`: enroll, remove), **Intrusions** (`i`: view or dismiss photos of faces that were clearly not you) and **Settings** (`s`: thresholds, timeout, camera). `t` runs a test scan, `q` quits.
+
+After enrollment, face unlock is active for the PAM services you enabled during setup. A scan answers in about a second in good conditions and gives up after at most 7 seconds, handing over to the password prompt.
+
+## Upgrading
+
+Run `sudo ./setup.sh` again. It rebuilds and reinstalls the daemon, the PAM module and the CLI together, and asks whether to keep face unlock for `sudo` and the login screen.
+
+**From 0.1.3 or earlier, re-enroll afterwards** (`sentinel enroll $USER`): templates are built differently since 0.1.4, and re-enrolling also clears templates learned by the old version. See [`CHANGELOG.md`](CHANGELOG.md).
+
+## Testing
+
+```bash
+cargo test --lib                          # unit tests (alignment, decision rules, config, storage)
+python3 tests/general/test_tui.py         # dashboard, headless, no daemon needed
+python3 tests/general/test_spoof.py       # live: your face, then a photo/video of you
+python3 tests/general/test_recognition.py # live: distance, lighting, glasses, another person
+sudo ./target/release/auth-test --user $USER   # one scan with the built code, without installing it
+```
 
 ## How It Works
 
 ```
 Webcam → [Rust daemon] → SCRFD detect → 5-pt align → MobileFaceNet embed
-                       → MiniFASNet anti-spoof → Tier decision → DBus result
+                       → match → MiniFASNet anti-spoof → multi-frame decision → DBus result
 [C PAM module] ←────────────────────────────────────────────────────────────
      ↓
 PAM_SUCCESS (face matched) or PAM_IGNORE (fall through to password)
 ```
 
 - **`sentinel-core`** — Rust daemon running as root. Owns the camera, models, and gallery. Exposes a DBus interface (`com.sentinel.Sentinel`) for authentication, enrollment, configuration, and intrusion review.
-- **`pam-sentinel`** — Thin C shared library (`< 200 LOC`). Calls the daemon over DBus and maps the result to PAM return codes. Contains zero biometric code.
+- **`pam-sentinel`** — Thin C shared library. Calls the daemon over DBus and maps the result to PAM return codes. Contains zero biometric code.
 - **`sentinel-py`** — Python CLI and Textual TUI for enrollment, status, and configuration.
 
 Full architecture: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Pipeline details: [`docs/FRS_PIPELINE.md`](docs/FRS_PIPELINE.md)
@@ -99,13 +117,15 @@ Full architecture: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Pipeline det
 ## Security Model
 
 **Sentinel provides:**
-- ✓ Protection against photo and screen spoofing (MiniFASNetV2 anti-spoof model)
-- ✓ Active liveness detection — blink + head pose challenge for Tier 2/3 matches
+- ✓ A passive check against printed photos and simple screen replays (MiniFASNet anti-spoof models), on the same frame that matched
+- ✓ Multi-frame decisions: one clean strong match, or three matching frames in a row
+- ✓ An attempt limit: five failed face attempts in a minute pause face unlock
 - ✓ Adaptive gallery that handles gradual appearance changes over time
 - ✓ Audit logging of all authentication attempts to `/var/log/sentinel/`
 - ✓ Automatic password fallback if the camera or daemon is unavailable
 
 **Sentinel does NOT protect against:**
+- ✗ A good video of you played on a good screen (no RGB-only webcam system reliably stops this)
 - ✗ High-quality 3D mask attacks
 - ✗ Complete darkness — face detection requires ambient light
 - ✗ Physical camera tampering (V4L2 loopback injection)
@@ -115,10 +135,10 @@ Face authentication is a **convenience factor and anti-shoulder-surfing measure*
 
 ## Known Limitations
 
-- **Low light** — Authentication fails when ambient light is too low for face detection. CLAHE preprocessing helps with mild low light but cannot compensate for near-darkness.
+- **Low light** — Dim frames are brightened for face detection, but a face that is too dark is skipped and the scan times out to the password prompt.
 - **Distance** — Reliable detection range is approximately 30–80 cm from camera. Beyond ~80 cm, the face bounding box may fall below the minimum size for SCRFD-500M at 320×320 input. Set `scrfd_input_size = 640` in `/etc/sentinel/config.toml` for better range at the cost of ~7 ms additional latency.
-- **MiniFASNet calibration** — On some cameras, the anti-spoof model relies primarily on distance thresholding rather than texture analysis. Run `sentinel calibrate-spoof` after enrollment to optimize for your camera.
-- **Tier thresholds are hardware-dependent** — The default `golden_threshold = 0.28` may result in Tier 1 on high-quality setups. Adjust in `/etc/sentinel/config.toml` based on your observed authentication distances (visible via `sentinel dashboard` or `journalctl -u sentinel`).
+- **Anti-spoofing is not proof of presence** — the anti-spoof models were trained on other cameras; test them on yours with `tests/general/test_spoof.py` using a photo and a phone video *of yourself*.
+- **Thresholds are hardware-dependent** — the face-match thresholds (`golden_threshold = 0.28`, `standard_threshold = 0.42`) and the anti-spoof thresholds (`spoof_threshold = 0.80`, `spoof_threshold_standard = 0.70`) were set from measurements on the maintainer's webcam. Check your own numbers with `sentinel auth` or the dashboard and adjust in the Settings screen or `/etc/sentinel/config.toml`. The daemon refuses values outside safe ranges.
 
 ## Contributing
 

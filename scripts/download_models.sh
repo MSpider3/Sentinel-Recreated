@@ -32,5 +32,21 @@ sudo chmod 644 "$MODEL_DIR/MiniFASNetV2.onnx"
 rm -rf "$MINIFAS_TMP"
 
 echo ""
+echo "Downloading MiniFASNetV1SE anti-spoof model..."
+sudo wget --show-progress \
+  "https://github.com/yakhyo/face-anti-spoofing/releases/download/weights/MiniFASNetV1SE.onnx" \
+  -O "$MODEL_DIR/MiniFASNetV1SE.onnx"
+sudo chmod 644 "$MODEL_DIR/MiniFASNetV1SE.onnx"
+
+echo ""
+echo "Verifying checksums..."
+sha256sum --check <<SUMS
+5e4447f50245bbd7966bd6c0fa52938c61474a04ec7def48753668a9d8b4ea3a  $MODEL_DIR/scrfd_500m_kps.onnx
+9cc6e4a75f0e2bf0b1aed94578f144d15175f357bdc05e815e5c4a02b319eb4f  $MODEL_DIR/mobile_facenet.onnx
+b32929adc2d9c34b9486f8c4c7bc97c1b69bc0ea9befefc380e4faae4e463907  $MODEL_DIR/MiniFASNetV2.onnx
+ebab7f90c7833fbccd46d3a555410e78d969db5438e169b6524be444862b3676  $MODEL_DIR/MiniFASNetV1SE.onnx
+SUMS
+
+echo ""
 echo "Model download completed successfully!"
 ls -lh "$MODEL_DIR"

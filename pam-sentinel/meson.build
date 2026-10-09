@@ -1,5 +1,5 @@
 project('pam-sentinel', 'c',
-  version: '0.1.3',
+  version: '0.1.4',
   default_options: ['c_std=c99']
 )
 
