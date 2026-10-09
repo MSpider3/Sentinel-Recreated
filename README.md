@@ -64,8 +64,8 @@ Face unlock is always set up for the lock screen. The installer **asks** before 
 ## Usage
 
 ```bash
-# Enroll your face (run once — asks whether you wear glasses, then guides you through 5 poses)
-sentinel enroll $USER
+# Enroll your face (run once — asks whether you wear glasses or not, then guides you through 5 poses)
+sentinel enroll $USER                 # ask for glasses or not
 sentinel enroll $USER --glasses      # or --no-glasses: answer the question in advance
 
 # Check daemon and enrollment status
