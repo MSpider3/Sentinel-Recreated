@@ -79,6 +79,13 @@ def cmd_auth(client: SentinelDBusClient, args):
 
 def cmd_enroll(client: SentinelDBusClient, args):
     username = args.username or get_current_user()
+    if os.geteuid() == 0 and os.environ.get("SUDO_USER"):
+        # root is not allowed to open windows on the user's desktop, so the
+        # camera preview would crash. The daemon asks for the administrator
+        # password itself when enrollment starts.
+        print("Run this without sudo:  sentinel enroll " + username)
+        print("You will be asked for the administrator password in a dialog.")
+        sys.exit(1)
     # No flag given: ask, rather than silently assuming "no glasses".
     glasses = args.glasses if args.glasses is not None else ask_glasses()
     wizard = EnrollmentWizard(username=username, glasses=glasses)

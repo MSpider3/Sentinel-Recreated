@@ -390,6 +390,13 @@ configure_pam() {
             ;;
         dankshell)
             inject_pam_line "/etc/pam.d/dankshell"
+            # This lock screen answers every PAM prompt by itself. After a
+            # failed face scan it would sit on the following password prompt
+            # for 15 s; fail_fast ends the attempt at once instead.
+            if [ "$DRY_RUN" -eq 0 ] && grep -qE "^auth[[:space:]]+sufficient[[:space:]]+pam_sentinel\.so[[:space:]]*$" /etc/pam.d/dankshell; then
+                sed -i -E "s|^auth[[:space:]]+sufficient[[:space:]]+pam_sentinel\.so[[:space:]]*$|auth       [success=done auth_err=die default=ignore]    pam_sentinel.so fail_fast|" /etc/pam.d/dankshell
+                echo "  Lock screen set to fail fast after an unsuccessful face scan."
+            fi
             configure_dms_settings
             ;;
         "")

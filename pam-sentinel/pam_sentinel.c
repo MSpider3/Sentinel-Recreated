@@ -49,14 +49,17 @@ static int sentinel_reachable(DBusConnection *c)
     return (int)has;
 }
 
-/* Ask the daemon to authenticate `user`. Returns 1 only if it answered
- * "GRANTED"; 0 for every other answer and for any DBus failure. */
-static int sentinel_granted(DBusConnection *c, const char *user,
-                            const char *ssh_client, const char *ssh_tty)
+#define SCAN_NOT_RUN 0   /* no camera scan happened, or the daemon did not answer */
+#define SCAN_GRANTED 1
+#define SCAN_FAILED  2   /* the camera looked at a face and did not grant */
+
+/* Ask the daemon to authenticate `user` and classify its answer. */
+static int sentinel_scan(DBusConnection *c, const char *user,
+                         const char *ssh_client, const char *ssh_tty)
 {
     DBusMessage *m = dbus_message_new_method_call(
         SENTINEL_BUS, SENTINEL_PATH, SENTINEL_IFACE, "Authenticate");
-    if (!m) return 0;
+    if (!m) return SCAN_NOT_RUN;
 
     DBusMessageIter it, arr;
     dbus_message_iter_init_append(m, &it);
@@ -91,27 +94,45 @@ static int sentinel_granted(DBusConnection *c, const char *user,
     DBusMessage *r = dbus_connection_send_with_reply_and_block(
                          c, m, SENTINEL_DBUS_TIMEOUT_MS, &e);
     dbus_message_unref(m);
-    if (dbus_error_is_set(&e) || !r) { dbus_error_free(&e); return 0; }
+    if (dbus_error_is_set(&e) || !r) { dbus_error_free(&e); return SCAN_NOT_RUN; }
 
-    int granted = 0;
+    int outcome = SCAN_NOT_RUN;
     const char *res = NULL;
     DBusMessageIter out;
     if (dbus_message_iter_init(r, &out)
         && dbus_message_iter_get_arg_type(&out) == DBUS_TYPE_STRING) {
         dbus_message_iter_get_basic(&out, &res);
-        granted = (res != NULL && strcmp(res, "GRANTED") == 0);
+        if (res != NULL) {
+            if (!strcmp(res, "GRANTED"))
+                outcome = SCAN_GRANTED;
+            else if (!strcmp(res, "DENIED") || !strcmp(res, "SPOOF") || !strcmp(res, "TIMEOUT"))
+                outcome = SCAN_FAILED;
+        }
     }
     dbus_message_unref(r); dbus_error_free(&e);
-    return granted;
+    return outcome;
 
 fail:
-    dbus_message_unref(m); return 0;
+    dbus_message_unref(m); return SCAN_NOT_RUN;
 }
 
 PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
                                     int argc, const char **argv)
 {
-    (void)flags; (void)argc; (void)argv;
+    (void)flags;
+
+    /* Optional module argument `fail_fast`, for lock screens that answer
+     * every PAM prompt themselves: after a face scan that ran and did not
+     * grant, return PAM_AUTH_ERR so the attempt ends at once and the password
+     * box is free again, instead of handing over to a password prompt nobody
+     * is going to answer. Use it with a control that stops on that error:
+     *   auth [success=done auth_err=die default=ignore] pam_sentinel.so fail_fast
+     * A typed password, a skipped scan and an unreachable daemon still return
+     * PAM_IGNORE, so the password path is never blocked. Do not use it in a
+     * stack that counts failures with pam_faillock. */
+    int fail_fast = 0;
+    for (int i = 0; i < argc; i++)
+        if (argv[i] && !strcmp(argv[i], "fail_fast")) fail_fast = 1;
 
     /* Fail-Safe 1: If password was already supplied (e.g., entered in lock
      * screen password field or supplied by earlier module), do not intercept
@@ -179,7 +200,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
     const char *ssh_t = getenv("SSH_TTY");
 
     /* 5. Call Authenticate(username, session_env) */
-    int granted = sentinel_granted(conn, user, ssh_c, ssh_t);
+    int outcome = sentinel_scan(conn, user, ssh_c, ssh_t);
     dbus_connection_close(conn); dbus_connection_unref(conn);
 
     /* 6. Map the daemon's answer → PAM return code. A failed DBus call or an
@@ -197,7 +218,11 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int flags,
      * to standard password authentication (pam_unix.so). Biometric failures can
      * NEVER lock a user out of their own machine.
      */
-    return granted ? PAM_SUCCESS : PAM_IGNORE;
+    if (outcome == SCAN_GRANTED)
+        return PAM_SUCCESS;
+    if (outcome == SCAN_FAILED && fail_fast)
+        return PAM_AUTH_ERR;
+    return PAM_IGNORE;
 }
 
 /* pam_sm_setcred: required export for PAM_SM_AUTH modules.

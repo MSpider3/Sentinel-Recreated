@@ -142,9 +142,12 @@ impl AuditLogger {
                     .flatten()
                     .map(|e| e.path())
                     .filter(|p| {
+                        // Exactly auth_YYYY-MM-DD.log; other files in the
+                        // directory (e.g. logs of older versions) are not ours.
                         p.file_name()
                             .and_then(|n| n.to_str())
-                            .map_or(false, |n| n.starts_with("auth_") && n.ends_with(".log"))
+                            .and_then(|n| n.strip_prefix("auth_")?.strip_suffix(".log"))
+                            .map_or(false, |d| NaiveDate::parse_from_str(d, "%Y-%m-%d").is_ok())
                     })
                     .collect()
             })
@@ -254,6 +257,8 @@ mod tests {
             tmp_dir.join(format!("auth_{}.log", Local::now().format("%Y-%m-%d"))),
         )
         .unwrap();
+        // A differently named log left by an older version must be ignored.
+        fs::write(tmp_dir.join("auth_audit_2020-01-09.log"), "old format\n").unwrap();
         let recent = logger.recent_lines(4);
         assert_eq!(recent[..3], ["b", "c", "d"]);
         assert_eq!(recent[3], today.trim_end());
